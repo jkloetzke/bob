@@ -39,6 +39,7 @@ warnCheckoutConsume = WarnOnce("Usage of checkoutConsume is deprecated. Use chec
 warnBuildConsume = WarnOnce("Usage of buildConsume is deprecated. Use buildVars instead.")
 warnPackageConsume = WarnOnce("Usage of packageConsume is deprecated. Use packageVars instead.")
 warnFilter = WarnOnce("The filter keyword is experimental and might change or vanish in the future.")
+warnSubProject = WarnOnce("Subprojects are experimental and might change or vanish in the future.")
 
 def _hashString(string):
     h = hashlib.md5()
@@ -1532,14 +1533,15 @@ class Recipe(object):
             self.packageStep = packageStep
 
     @staticmethod
-    def loadFromFile(recipeSet, fileName, properties, isClass):
-        recipe = recipeSet.loadYaml(fileName)
+    def loadFromFile(recipeSet, namespace, rootDir, fileName, properties, isClass):
+        fileName = os.path.normpath(fileName)
+        recipe = recipeSet.loadYaml(os.path.join(rootDir, fileName))
 
         # MultiPackages are handled as separate recipes with an anonymous base
-        # class. Ignore first dir in path, which is 'recipes' by default.
-        # Following dirs are treated as categories separated by '::'.
-        baseName = "::".join( os.path.splitext( fileName )[0].split( os.sep )[1:] )
-        baseDir = os.path.dirname(fileName)
+        # class. Subdirectories are treated as categories separated by '::'.
+        baseName = namespace
+        baseName += "::".join( os.path.splitext( fileName )[0].split( os.sep ) )
+        baseDir = os.path.join(rootDir, os.path.dirname(fileName))
         if "multiPackage" in recipe:
             if isClass:
                 raise ParseError("Classes may not use 'multiPackage'")
@@ -1621,13 +1623,14 @@ class Recipe(object):
 
         # calculate order of classes (depth first)
         visited = set()
-        backlog = [ self.__recipeSet.getClass(c) for c in self.__inherit ]
+        backlog = [ self.__recipeSet.getClass(self.__packageName, c) for c in self.__inherit ]
         if self.__anonBaseClass: backlog.insert(0, self.__anonBaseClass)
         inherit = []
         while backlog:
             next = backlog.pop(0)
             if next.getName() in visited: continue
-            subInherit = [ self.__recipeSet.getClass(c) for c in next.__inherit if c not in visited ]
+            subInherit = [ self.__recipeSet.getClass(self.__packageName, c)
+                           for c in next.__inherit if c not in visited ]
             if subInherit:
                 # prepend and re-insert current class
                 backlog[0:0] = subInherit + [next]
@@ -1763,7 +1766,7 @@ class Recipe(object):
 
             if isinstance(dep, Recipe.Dependency):
                 if not env.evaluate(dep.condition, "dependency "+dep.recipe): continue
-                r = self.__recipeSet.getRecipe(dep.recipe)
+                r = self.__recipeSet.getRecipe(self.__packageName, dep.recipe)
                 try:
                     p = r.prepare(pathFormatter, depEnv.derive(dep.envOverride),
                                   sandboxEnabled, depStates, depSandbox, depTools,
@@ -1939,7 +1942,7 @@ class RecipeSet:
         self.__whiteList = set(["TERM", "SHELL", "USER", "HOME"])
         self.__archive = { "backend" : "none" }
         self.__hooks = {}
-        self.__configFiles = {}
+        self.__configFiles = []
         self.__properties = {}
         self.__states = {}
         self.__cache = YamlCache()
@@ -1968,9 +1971,9 @@ class RecipeSet:
             raise ParseError("Class "+name+" already defined")
         self.__classes[name] = recipe
 
-    def __loadPlugins(self, plugins):
+    def __loadPlugins(self, subDir, plugins):
         for p in plugins:
-            name = os.path.join("plugins", p+".py")
+            name = os.path.join(subDir, "plugins", p+".py")
             if not os.path.exists(name):
                 raise ParseError("Plugin '"+name+"' not found!")
             self.__loadPlugin(name)
@@ -2062,67 +2065,88 @@ class RecipeSet:
         self.__cache.open()
         try:
             self.__parse()
+
+            # config files overrule everything else
+            for c in self.__configFiles:
+                c = str(c) + ".yaml"
+                if not os.path.isfile(c):
+                    raise ParseError("Config file {} does not exist!".format(c))
+                self.__parseUserConfig("", c)
         finally:
             self.__cache.close()
 
-    def __parse(self):
-        config = self.loadYaml("config.yaml")
+    def __parse(self, subDir="", namespace=""):
+        # project config
+        config = self.loadYaml(os.path.join(subDir, "config.yaml"))
         minVer = config.get("bobMinimumVersion", "0.1")
         if compareVersion(BOB_VERSION, minVer) < 0:
             raise ParseError("Your Bob is too old. At least version "+minVer+" is required!")
-        self.__extStrings = compareVersion(minVer, "0.3") >= 0
-        self.__loadPlugins(config.get("plugins", []))
+        for subProject in config.get("subProjects", []):
+            warnSubProject.warn()
+            self.__parse(os.path.join(subDir, "projects", subProject),
+                         namespace+subProject+"::")
+        self.__extStrings = compareVersion(minVer, "0.3") >= 0 # FIXME: sub-projects
+        self.__loadPlugins(subDir, config.get("plugins", []))
 
-        defaults = self.loadYaml("default.yaml")
-        if "environment" in defaults:
-            self.__defaultEnv = defaults["environment"]
-            if not isinstance(self.__defaultEnv, dict):
-                raise ParseError("default.yaml environment must be a dict")
-        self.__whiteList |= set(defaults.get("whitelist", []))
-        self.__archive = defaults.get("archive", { "backend" : "none" })
+        # user config(s)
+        self.__parseUserConfig(subDir, "default.yaml")
 
-        for p in defaults.get("include", []):
-            include = self.loadYaml(str(p) + ".yaml")
-            if include and "environment" in include:
-                self.__defaultEnv.update(include["environment"])
-
-        for c in self.__configFiles:
-            cc = self.loadYaml(str(c) + ".yaml")
-            if not cc:
-                raise ParseError("Error while loading config File {}".format(c))
-            if "environment" in cc:
-                self.__defaultEnv.update(cc["environment"])
-
-        if not os.path.isdir("recipes"):
+        # finally parse recipes
+        recipesDir = os.path.join(subDir, "recipes")
+        if not os.path.isdir(recipesDir):
             raise ParseError("No recipes directory found.")
+        self.__parseRecipes(recipesDir, namespace, False, self.__addRecipe)
+        self.__parseRecipes(os.path.join(subDir, 'classes'), namespace, True,
+                            self.__addClass)
 
-        for root, dirnames, filenames in os.walk('classes'):
+    def __parseRecipes(self, subDir, namespace, isClass, handler):
+        for root, dirnames, filenames in os.walk(subDir):
+            root = os.path.relpath(root, subDir)
             for path in fnmatch.filter(filenames, "*.yaml"):
                 try:
-                    [r] = Recipe.loadFromFile(self, os.path.join(root, path), self.__properties, True)
-                    self.__addClass(r)
+                    for r in Recipe.loadFromFile(self, namespace, subDir, os.path.join(root, path),
+                                                 self.__properties, isClass):
+                        handler(r)
                 except ParseError as e:
                     e.pushFrame(path)
                     raise
 
-        for root, dirnames, filenames in os.walk('recipes'):
-            for path in fnmatch.filter(filenames, "*.yaml"):
-                try:
-                    for r in Recipe.loadFromFile(self,  os.path.join(root, path), self.__properties, False):
-                        self.__addRecipe(r)
-                except ParseError as e:
-                    e.pushFrame(path)
-                    raise
+    def __parseUserConfig(self, subDir, fileName):
+        cfg = self.loadYaml(os.path.join(subDir, fileName))
+        self.__defaultEnv.update(cfg.get("environment", {}))
+        self.__whiteList |= set(cfg.get("whitelist", []))
+        self.__archive = cfg.get("archive", { "backend" : "none" }) # FIXME: sub-projects
 
-    def getRecipe(self, packageName):
-        if packageName not in self.__recipes:
-            raise ParseError("Package {} requested but not found.".format(packageName))
-        return self.__recipes[packageName]
+        for p in cfg.get("include", []):
+            self.__parseUserConfig(self, subDir, str(p) + ".yaml")
 
-    def getClass(self, className):
-        if className not in self.__classes:
-            raise ParseError("Class {} requested but not found.".format(className))
-        return self.__classes[className]
+    def getRecipe(self, requestor, packageName):
+        namespace = requestor.rpartition("::")[0]
+        ret = self.__lookup(namespace, packageName, self.__recipes)
+        if not ret:
+            raise ParseError("Package '{}' depends on '{}' that is nowhere to be found."
+                                .format(requestor, packageName))
+        return ret
+
+    def getClass(self, requestor, className):
+        namespace = requestor.rpartition("::")[0]
+        ret = self.__lookup(namespace, className, self.__classes)
+        if not ret:
+            raise ParseError("Package '{}' inherits '{}' that could not be found."
+                                .format(requestor, className))
+        return ret
+
+    def __lookup(self, namespace, name, recipes):
+        if name.startswith("::"):
+            # absolute name
+            return recipes.get(name[2:])
+        else:
+            # search namespaces upwards
+            while namespace:
+                ret = recipes.get(namespace+"::"+name)
+                if ret: return ret
+                namespace = namespace.rpartition("::")[0]
+            return recipes.get(name)
 
     def generatePackages(self, nameFormatter, envOverrides={}, sandboxEnabled=False):
         result = {}
