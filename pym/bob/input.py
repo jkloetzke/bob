@@ -2896,24 +2896,96 @@ class PackageUnpickler(pickle.Unpickler):
             return super().find_class(module, name)
 
 
+def _filterNamePlain(upstream, match):
+    for (stack, name, package) in upstream:
+        if name == match:
+            yield (stack, name, package)
+
+def _filterNameMatch(upstream, match):
+    for (stack, name, package) in upstream:
+        if fnmatch.fnmatchcase(name, match):
+            yield (stack, name, package)
+
+def _filterName(upstream, match):
+    if any(i in match for i in '*?[]'):
+        yield from _filterNameMatch(upstream, match)
+    else:
+        yield from _filterNamePlain(upstream, match)
+
+def _expandChilds(upstream):
+    (stack, name, package) = upstream
+    seen = set()
+    stack = stack + [(name, package)]
+    for s in package.getDirectDepSteps():
+        p = s.getPackage()
+        seen.add(p.getName())
+        yield (stack, p.getName(), p)
+    for s in package.getIndirectDepSteps():
+        p = s.getPackage()
+        name = s.getName()
+        if name in seen: continue
+        seen.add(name)
+        yield (stack, name, p)
+
+def _expandAllChilds(upstream):
+    for i in upstream: yield from _expandChilds(i)
+
+def _expandParent(upstream):
+    for (stack, name, package) in upstream:
+        if not stack: continue
+        (n, p) = stack[-1]
+        yield (stack[:-1], n, p)
+
+def _expandDescendentOrSelf(upstream):
+    for i in upstream:
+        yield i
+        yield from _expandDescendentOrSelf(_expandChilds(i))
+
+def _expand(cursor, step, firstOrLast):
+    if step == "":
+        yield from _expandDescendentOrSelf(cursor)
+    elif step == "..":
+        yield from _expandParent(cursor)
+    elif firstOrLast:
+        yield from _filterName(cursor, step)
+    else:
+        yield from _filterName(_expandAllChilds(cursor), step)
+
 def walkPackagePath(rootPackages, path):
-    thisPackage = None
-    nextPackages = rootPackages.copy()
-    steps = [ s for s in path.split("/") if s != "" ]
-    trail = []
+    rootPackages = [ ([], name, pkg) for (name, pkg) in rootPackages.items() ]
+    steps = path.split("/")
+    if not steps: raise ParseError("empty path")
+    if steps[0] == "": raise ParseError("must not start with /")
+    while steps[-1] == "": del steps[-1]
+
+    cursor = rootPackages
+    first = True
     for step in steps:
-        if step not in nextPackages:
-            raise ParseError("Package '{}' not found under '{}'".format(step, "/".join(trail)))
-        thisPackage = nextPackages[step]
-        trail.append(step)
-        nextPackages = { s.getPackage().getName() : s.getPackage()
-            for s in thisPackage.getDirectDepSteps() }
-        for s in thisPackage.getIndirectDepSteps():
-            p = s.getPackage()
-            nextPackages.setdefault(p.getName(), p)
+        cursor = _expand(cursor, step, first)
+        first = False
+    #cursor = _expand(cursor, steps[-1], True)
 
-    if not thisPackage:
-        raise ParseError("Must specify a valid package to build")
+    return (i[2] for i in cursor)
 
-    return thisPackage
+
+#def walkPackagePath(rootPackages, path):
+#    thisPackage = None
+#    nextPackages = rootPackages.copy()
+#    steps = [ s for s in path.split("/") if s != "" ]
+#    trail = []
+#    for step in steps:
+#        if step not in nextPackages:
+#            raise ParseError("Package '{}' not found under '{}'".format(step, "/".join(trail)))
+#        thisPackage = nextPackages[step]
+#        trail.append(step)
+#        nextPackages = { s.getPackage().getName() : s.getPackage()
+#            for s in thisPackage.getDirectDepSteps() }
+#        for s in thisPackage.getIndirectDepSteps():
+#            p = s.getPackage()
+#            nextPackages.setdefault(p.getName(), p)
+#
+#    if not thisPackage:
+#        raise ParseError("Must specify a valid package to build")
+#
+#    return thisPackage
 

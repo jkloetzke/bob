@@ -986,13 +986,14 @@ def commonBuildDevelop(parser, argv, bobRoot, develop):
     builder.setCleanCheckout(args.clean_checkout)
     if args.resume: builder.loadBuildState()
 
-    backlog = []
+    backlog = set()
     results = []
     for p in args.packages:
-        packageStep = walkPackagePath(rootPackages, p).getPackageStep()
-        backlog.append(packageStep)
-        # automatically include provided deps when exporting
-        if args.destination: backlog.extend(packageStep._getProvidedDeps())
+        for i in walkPackagePath(rootPackages, p):
+            packageStep = i.getPackageStep()
+            backlog.add(packageStep)
+            # automatically include provided deps when exporting
+            if args.destination: backlog.update(packageStep._getProvidedDeps())
     try:
         for p in backlog:
             builder.cook([p], p.getPackage(), args.checkout_only)
