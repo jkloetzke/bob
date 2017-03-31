@@ -2922,7 +2922,7 @@ def _expandChilds(upstream):
         yield (stack, p.getName(), p)
     for s in package.getIndirectDepSteps():
         p = s.getPackage()
-        name = s.getName()
+        name = p.getName()
         if name in seen: continue
         seen.add(name)
         yield (stack, name, p)
