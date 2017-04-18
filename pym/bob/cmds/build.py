@@ -19,6 +19,7 @@ from ..archive import DummyArchive, getArchiver
 from ..audit import Audit
 from ..errors import BobError, BuildError, ParseError
 from ..input import RecipeSet, walkPackagePath
+from ..pathspec import evalPathSpec
 from ..state import BobState
 from ..tty import colorize
 from ..utils import asHexStr, hashDirectory, hashFile, removePath, emptyDirectory, copyTree
@@ -989,17 +990,19 @@ def commonBuildDevelop(parser, argv, bobRoot, develop):
     backlog = set()
     results = []
     for p in args.packages:
-        for i in walkPackagePath(rootPackages, p):
+        for i in evalPathSpec(rootPackages, p):
+            print("/".join(i.getStack()))
             packageStep = i.getPackageStep()
             backlog.add(packageStep)
             # automatically include provided deps when exporting
             if args.destination: backlog.update(packageStep._getProvidedDeps())
     try:
         for p in backlog:
-            builder.cook([p], p.getPackage(), args.checkout_only)
-            resultPath = p.getWorkspacePath()
-            if resultPath not in results:
-                results.append(resultPath)
+            pass
+            #builder.cook([p], p.getPackage(), args.checkout_only)
+            #resultPath = p.getWorkspacePath()
+            #if resultPath not in results:
+            #    results.append(resultPath)
     finally:
         builder.saveBuildState()
 
