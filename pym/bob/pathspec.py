@@ -4,17 +4,18 @@ from fnmatch import fnmatchcase
 import pyparsing
 
 # nodes of name graph
-GraphNode = namedtuple('GraphNode', ['pkg', 'parents', 'childs'])
+GraphNode = namedtuple('GraphNode', ['parents', 'childs'])
 
 # parsing grammer
 RelativeLocationPath = pyparsing.Forward()
-AxisName = pyparsing.Keyword("child") \
+AxisName = \
+      pyparsing.Keyword("descendant-or-self") \
+    | pyparsing.Keyword("ancestor-or-self") \
+    | pyparsing.Keyword("child") \
     | pyparsing.Keyword("descendant") \
     | pyparsing.Keyword("parent") \
     | pyparsing.Keyword("ancestor") \
-    | pyparsing.Keyword("self") \
-    | pyparsing.Keyword("descendant-or-self") \
-    | pyparsing.Keyword("ancestor-or-self")
+    | pyparsing.Keyword("self")
 NodeTest = pyparsing.Word(pyparsing.alphanums + "_.:+-*")
 AxisSpecifier = AxisName + '@'
 AbbreviatedStep = pyparsing.Keyword('..') | pyparsing.Keyword('.')
@@ -33,7 +34,7 @@ def _buildGraph(graph, name, pkg, parent):
         node.parents.add(parent)
         return key
 
-    graph[key] = node = GraphNode(pkg, set(), set())
+    graph[key] = node = GraphNode(set([parent]), set())
 
     for s in pkg.getDirectDepSteps():
         childPkg = s.getPackage()
@@ -49,7 +50,7 @@ def _buildGraph(graph, name, pkg, parent):
 def buildGraph(rootPackages):
     graph = {}
     key = ('<root>', None)
-    graph[key] = node = GraphNode(None, set(), set())
+    graph[key] = node = GraphNode(set(), set())
     for (name, pkg) in rootPackages.items():
         childKey = _buildGraph(graph, name, pkg, key)
         node.childs.add(childKey)
@@ -88,7 +89,32 @@ def evalAxisAncestor(graph, nodes):
         ret.update(parents)
     return ret
 
-def evalPathStep(graph, step, nodes):
+def findIntermediateNodes(graph, old, new):
+    visited = set()
+    intermediate = set()
+    if old.issuperset(new): return intermediate
+
+    #print(old)
+    #print(new)
+
+    def traverse(node, stack):
+        if node in visited: return
+
+        if node in new:
+            intermediate.update(stack)
+        else:
+            stack = stack + [node]
+            for i in graph[node].childs:
+                traverse(i, stack)
+            visited.add(node)
+
+    for n in old: traverse(n, [])
+
+    #print(intermediate)
+    #print("====================")
+    return intermediate
+
+def evalPathStep(graph, step, nodes, valid):
     if len(step) == 1:
         if step[0] == '.':
             axis = 'self'
@@ -106,14 +132,15 @@ def evalPathStep(graph, step, nodes):
 
     #print(">> evalPathStep", axis, test, len(nodes))
 
+    oldNodes = nodes
     if axis == "child":
         nodes = evalAxisChild(graph, nodes)
     elif axis == "descendant":
         nodes = evalAxisDescendant(graph, nodes)
     elif axis == "parent":
-        nodes = evalAxisParent(graph, nodes)
+        nodes = evalAxisParent(graph, nodes) & valid
     elif axis == "ancestor":
-        nodes = evalAxisAncestor(graph, nodes)
+        nodes = evalAxisAncestor(graph, nodes) & valid
     elif axis == "self":
         pass
     elif axis == "descendant-or-self":
@@ -131,19 +158,46 @@ def evalPathStep(graph, step, nodes):
         nodes = set(i for i in nodes if i[0] == test)
 
     #print("<< evalPathStep", len(nodes))
+    valid.update(findIntermediateNodes(graph, oldNodes, nodes))
+    valid.update(nodes)
     return nodes
 
-def evalPathSegment(graph, nodes, path):
+def evalPathSegment(graph, nodes, path, valid):
     if len(path) == 1:
         # last segment
-        return evalPathStep(graph, path[0], nodes)
+        return evalPathStep(graph, path[0], nodes, valid)
     else:
         # intermediate segment, fixup descendant-or-self
         if path[1] == '//':
             path[1] = '/'
             path[2] = [['descendant-or-self', '@', '*'], '/', path[2]]
         assert path[1] == '/'
-        return evalPathSegment(graph, evalPathStep(graph, path[0], nodes), path[2])
+        return evalPathSegment(graph, evalPathStep(graph, path[0], nodes, valid), path[2], valid)
+
+def findResults(graph, node, pkg, result, valid):
+    nextPackages = { s.getPackage().getName() : s.getPackage()
+        for s in pkg.getDirectDepSteps() }
+    for s in pkg.getIndirectDepSteps():
+        p = s.getPackage()
+        nextPackages.setdefault(p.getName(), p)
+
+    #print(node, nextPackages)
+    #print(sorted(graph[node].childs & valid))
+    for child in sorted(graph[node].childs & valid):
+        if child in result:
+            yield nextPackages[child[0]]
+        else:
+            yield from findResults(graph, child, nextPackages[child[0]], result, valid)
+
+class FakeRoot:
+    def __init__(self, childs):
+        self.__childs = childs
+
+    def getDirectDepSteps(self):
+        return (i.getPackageStep() for i in self.__childs)
+
+    def getIndirectDepSteps(self):
+        return []
 
 def evalPathSpec(rootPackages, path):
     while path.endswith('/'): path = path[:-1]
@@ -158,6 +212,13 @@ def evalPathSpec(rootPackages, path):
     else:
         roots = set([root])
 
-    print(path)
-    nodes = evalPathSegment(graph, roots, path)
+    #print(path)
+    valid = set(roots)
+    nodes = evalPathSegment(graph, roots, path, valid)
+
+    #print(nodes)
+    #print(valid)
+    #print("*****************")
+    return findResults(graph, root, FakeRoot(list(rootPackages.values())), nodes, valid)
+
     return (graph[n].pkg for n in sorted(nodes))
