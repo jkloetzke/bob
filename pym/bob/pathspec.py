@@ -13,20 +13,11 @@ class PathAction:
             for t in toks
             if t != "/"
         ]
+        self.__absolute = (toks[0] == '/') or (toks[0] == '//')
         self.__graph = graph
 
     def __repr__(self):
         return "PathAction({})".format(self.__path)
-
-    def evalForward(self, root):
-        nodes = set([root])
-        valid = set([root])
-        for i in self.__path:
-            oldNodes = nodes
-            nodes = i.evalForward(nodes, valid)
-            valid.update(self.__findIntermediateNodes(oldNodes, nodes))
-            valid.update(nodes)
-        return (nodes, valid)
 
     def __findIntermediateNodes(self, old, new):
         visited = set()
@@ -52,6 +43,28 @@ class PathAction:
         #print(intermediate)
         #print("====================")
         return intermediate
+
+    def evalForward(self, root):
+        nodes = set([root])
+        valid = set([root])
+        for i in self.__path:
+            oldNodes = nodes
+            nodes = i.evalForward(nodes, valid)
+            valid.update(self.__findIntermediateNodes(oldNodes, nodes))
+            valid.update(nodes)
+        return (nodes, valid)
+
+    def evalBackward(self):
+        nodes = set(self.__graph.keys())
+        for i in reversed(self.__path):
+            nodes = i.evalBackward(nodes)
+        if self.__absolute:
+            root = ('<root>', None) # FIXME
+            if root in nodes:
+                nodes = set(self.__graph.keys())
+            else:
+                nodes = set()
+        return nodes
 
 class StepAction:
     def __init__(self, step, graph):
@@ -120,7 +133,6 @@ class StepAction:
     def evalForward(self, nodes, valid):
         #print(">> evalForward", self.__axis, self.__test, len(nodes))
 
-        oldNodes = nodes
         if self.__axis == "child":
             nodes = self.__evalAxisChild(nodes)
         elif self.__axis == "descendant":
@@ -145,7 +157,40 @@ class StepAction:
         else:
             nodes = set(i for i in nodes if i[0] == self.__test)
 
+        if self.__pred:
+            nodes = nodes & self.__pred.evalBackward()
+
         #print("<< evalForward", len(nodes))
+        return nodes
+
+    def evalBackward(self, nodes):
+        if self.__test == "*":
+            pass
+        elif '*' in self.__test:
+            nodes = set(i for i in nodes if fnmatchcase(i[0], self.__test))
+        else:
+            nodes = set(i for i in nodes if i[0] == self.__test)
+
+        if self.__pred:
+            nodes = nodes & self.__pred.evalBackward()
+
+        if self.__axis == "child":
+            nodes = self.__evalAxisParent(nodes)
+        elif self.__axis == "descendant":
+            nodes = self.__evalAxisAncestor(nodes)
+        elif self.__axis == "parent":
+            nodes = self.__evalAxisChild(nodes)
+        elif self.__axis == "ancestor":
+            nodes = self.__evalAxisDescendant(nodes)
+        elif self.__axis == "self":
+            pass
+        elif self.__axis == "descendant-or-self":
+            nodes = self.__evalAxisAncestor(nodes) | nodes
+        elif self.__axis == "ancestor-or-self":
+            nodes = self.__evalAxisDescendant(nodes) | nodes
+        else:
+            assert False, "Invalid axis: " + self.__axis
+
         return nodes
 
 class NotPredicate:
@@ -160,6 +205,9 @@ class NotPredicate:
     def __repr__(self):
         return "NotPredicate({})".format(self.op)
 
+    def evalBackward(self):
+        return set(self.graph.keys()) - self.op.evalBackward()
+
 class AndPredicate:
     def __init__(self, toks, graph):
         self.graph = graph
@@ -173,6 +221,9 @@ class AndPredicate:
     def __repr__(self):
         return "AndPredicate({}, {})".format(self.left, self.right)
 
+    def evalBackward(self):
+        return self.left.evalBackward() & self.right.evalBackward()
+
 class OrPredicate:
     def __init__(self, toks, graph):
         self.graph = graph
@@ -185,6 +236,9 @@ class OrPredicate:
 
     def __repr__(self):
         return "OrPredicate({}, {})".format(self.left, self.right)
+
+    def evalBackward(self):
+        return self.left.evalBackward() | self.right.evalBackward()
 
 
 class PackageGraph:
