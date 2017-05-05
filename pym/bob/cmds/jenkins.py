@@ -429,7 +429,237 @@ class JenkinsJob:
     def _auditName(d):
         return d.getWorkspacePath().replace('/', '_') + ".json.gz"
 
+    def _getSpec(self, windows, options):
+        ret = {
+            "upstreamProjects" : [],
+            "inputArtifacts" : [],
+            "prepare" : "",
+            "scms" : [],
+            "checkout" : [],
+            "buildIdCalc" : "",
+            "auditCalc" : "",
+            "download" : "",
+            "build" : [],
+            "package" : [],
+            "install" : [],
+            "outputArtifacts" : [],
+        }
+
+        sharedDir = options.get("shared.dir", "${JENKINS_HOME}/bob")
+
+        prepareCmds = []
+        prepareCmds.append(self.getShebang(windows))
+        prepareCmds.append("mkdir -p .state")
+        if not windows:
+            # Verify umask for predictable file modes. Can be set outside of
+            # Jenkins but Bob requires that umask is everywhere the same for
+            # stable Build-IDs. Mask 0022 is enforced on local builds and in
+            # the sandbox. Check it and bail out if different.
+            prepareCmds.append("[[ $(umask) == 0022 ]] || exit 1")
+
+        prepareCmds.append("")
+        prepareCmds.append("# delete unused files and directories from workspace")
+        prepareCmds.append("pruneUnused()")
+        prepareCmds.append("{")
+        prepareCmds.append("   set +x")
+        prepareCmds.append("   local i key value")
+        prepareCmds.append("   declare -A allowed")
+        prepareCmds.append("")
+        prepareCmds.append("   for i in \"$@\" ; do")
+        prepareCmds.append("          key=\"${i%%/*}\"")
+        prepareCmds.append("          value=\"${i:$((${#key} + 1))}\"")
+        prepareCmds.append("          allowed[\"$key\"]=\"${allowed[\"$key\"]+${allowed[\"$key\"]} }${value}\"")
+        prepareCmds.append("   done")
+        prepareCmds.append("")
+        prepareCmds.append("   for i in * ; do")
+        prepareCmds.append("          if [[ ${allowed[\"$i\"]+true} ]] ; then")
+        prepareCmds.append("              if [[ ! -z ${allowed[\"$i\"]} && -d $i ]] ; then")
+        prepareCmds.append("                  pushd \"$i\" > /dev/null")
+        prepareCmds.append("                  pruneUnused ${allowed[\"$i\"]}")
+        prepareCmds.append("                  popd > /dev/null")
+        prepareCmds.append("              fi")
+        prepareCmds.append("          elif [[ -e \"$i\" ]] ; then")
+        prepareCmds.append("              echo \"Remove $PWD/$i\"")
+        prepareCmds.append("              chmod -R u+rw \"$i\"")
+        prepareCmds.append("              rm -rf \"$i\"")
+        prepareCmds.append("          fi")
+        prepareCmds.append("   done")
+        prepareCmds.append("}")
+        prepareCmds.append("")
+        whiteList = []
+        whiteList.extend([ JenkinsJob._tgzName(d) for d in self.__deps.values()])
+        whiteList.extend([ JenkinsJob._buildIdName(d) for d in self.__deps.values()])
+        whiteList.extend([ d.getWorkspacePath() for d in self.__checkoutSteps.values() ])
+        whiteList.extend([ d.getWorkspacePath() for d in self.__buildSteps.values() ])
+        prepareCmds.extend(wrapCommandArguments("pruneUnused", sorted(whiteList)))
+        prepareCmds.append("set -x")
+
+        deps = sorted(self.__deps.values())
+        if deps:
+            ret["upstreamProjects"] = [ self.__getJobName(d) for d in deps ]
+
+            # copy deps into workspace
+            for d in deps:
+                if d.isShared():
+                    vid = variantIdToName(d.getVariantId())
+                    condition = sharedDir+"/"+vid[0:2]+"/"+vid[2:]
+                else:
+                    condition = ""
+                ret["inputArtifacts"].append({
+                    "condition" : condition,
+                    "project" : self.__getJobName(d),
+                    "filter" : JenkinsJob._tgzName(d)+","+JenkinsJob._buildIdName(d)
+                })
+
+            # extract deps
+            prepareCmds.append("\n# extract deps\n# ============")
+            for d in deps:
+                if d.isShared():
+                    vid = variantIdToName(d.getVariantId())
+                    prepareCmds.append("")
+                    prepareCmds.append(textwrap.dedent("""\
+                        # {PACKAGE}
+                        if [ ! -d {SHARED}/{VID1}/{VID2} ] ; then
+                            mkdir -p {SHARED}
+                            T=$(mktemp -d -p {SHARED})
+                            tar xf {TGZ} -C $T meta/audit.json.gz content/
+                            cp {BUILDID} $T/meta/buildid.bin
+                            mkdir -p {SHARED}/{VID1}
+                            mv -T $T {SHARED}/{VID1}/{VID2} || rm -rf $T
+                        fi
+                        mkdir -p {WSP_DIR}
+                        ln -sfT {SHARED}/{VID1}/{VID2}/content {WSP_PATH}
+                        ln -sfT {SHARED}/{VID1}/{VID2}/meta/audit.json.gz {AUDIT}
+                        ln -sfT {SHARED}/{VID1}/{VID2}/meta/buildid.bin {BUILDID}
+                        """.format(VID1=vid[0:2], VID2=vid[2:], TGZ=JenkinsJob._tgzName(d),
+                                   WSP_DIR=os.path.dirname(d.getWorkspacePath()),
+                                   WSP_PATH=d.getWorkspacePath(),
+                                   SHARED=sharedDir,
+                                   AUDIT=JenkinsJob._auditName(d),
+                                   BUILDID=JenkinsJob._buildIdName(d),
+                                   PACKAGE="/".join(d.getPackage().getStack()))))
+                else:
+                    prepareCmds.append("mkdir -p " + d.getWorkspacePath())
+                    prepareCmds.append(
+                        "tar xf {TGZ} --transform='s|^meta/audit.json.gz|{AUDIT}|' --transform=\"s|^content|{WSP_PATH}|\" meta/audit.json.gz content/".format(
+                        TGZ=JenkinsJob._tgzName(d),
+                        AUDIT=JenkinsJob._auditName(d),
+                        WSP_PATH=d.getWorkspacePath()))
+
+        ret["prepare"] = "\n".join(prepareCmds)
+
+        # checkout steps
+        checkoutSCMs = []
+        checkoutScripts = []
+        for d in sorted(self.__checkoutSteps.values()):
+            if d.getJenkinsScript() is not None:
+                checkoutScripts.append(self.dumpStep(d, windows, []))
+            checkoutSCMs.append(d)
+
+        ret["scms"] = checkoutSCMs
+        ret["checkout"] = checkoutScripts
+
+        # calculate Build-ID
+        buildIdCalc = [
+            self.getShebang(windows),
+            "# create build-ids"
+        ]
+        for d in sorted(self.__checkoutSteps.values()):
+            buildIdCalc.extend(self.dumpStepBuildIdGen(d))
+        for d in sorted(self.__buildSteps.values()):
+            buildIdCalc.extend(self.dumpStepBuildIdGen(d))
+        for d in sorted(self.__packageSteps.values()):
+            buildIdCalc.extend(self.dumpStepBuildIdGen(d))
+        ret["buildIdCalc"] = "\n".join(buildIdCalc)
+
+        # generate audit trail of checkout steps
+        if self.__checkoutSteps:
+            checkoutAudit = [
+                self.getShebang(windows),
+                "# generate audit trail of checkout step(s)"
+            ]
+            for d in sorted(self.__checkoutSteps.values()):
+                checkoutAudit.append(self.dumpStepAuditGen(d))
+            ret["auditCalc"] = "\n".join(checkoutAudit)
+
+        # download if possible
+        downloadCmds = []
+        for d in sorted(self.__packageSteps.values()):
+            # only download tools if built in sandbox
+            if d.doesProvideTools() and (d.getSandbox() is None):
+                continue
+            cmd = self.__archive.download(d, JenkinsJob._buildIdName(d), JenkinsJob._tgzName(d))
+            if not cmd: continue
+            downloadCmds.append(cmd)
+        if downloadCmds:
+            downloadCmds.insert(0, self.getShebang(windows, False))
+            downloadCmds.append("true # don't let downloads fail the build")
+            ret["download"] = "\n".join(downloadCmds)
+
+        # build steps
+        for d in sorted(self.__buildSteps.values()):
+            affectedPackageSteps = [ pkgStep for pkgStep in self.__packageSteps.values()
+                if d in pkgStep.getArguments() ]
+            ret["build"].append("\n".join([
+                    self.dumpStep(d, windows, affectedPackageSteps),
+                    "", "# generate audit trail",
+                    "cd $WORKSPACE",
+                    self.dumpStepAuditGen(d)
+                ]))
+
+        # package steps
+        publish = []
+        for d in sorted(self.__packageSteps.values()):
+            ret["package"].append("\n".join([
+                self.dumpStep(d, windows, [d]),
+                "", "# generate audit trail",
+                "cd $WORKSPACE",
+                self.dumpStepAuditGen(d),
+                "", "# pack result for archive and inter-job exchange",
+                "cd $WORKSPACE",
+                "tar zcfv {TGZ} -H pax --pax-option=\"bob-archive-vsn=1\" --transform='s|^{AUDIT}|meta/audit.json.gz|' --transform='s|^{WSP_PATH}|content|' {AUDIT} {WSP_PATH}".format(
+                    TGZ=JenkinsJob._tgzName(d),
+                    AUDIT=JenkinsJob._auditName(d),
+                    WSP_PATH=d.getWorkspacePath()),
+                "" if d.doesProvideTools() and (d.getSandbox() is None)
+                    else self.__archive.upload(d, JenkinsJob._buildIdName(d), JenkinsJob._tgzName(d))
+            ]))
+            publish.append(JenkinsJob._tgzName(d))
+            publish.append(JenkinsJob._buildIdName(d))
+
+        # published artifacts
+        ret["outputArtifacts"] = publish
+
+        # install shared packages
+        installCmds = []
+        for d in sorted(self.__packageSteps.values()):
+            if d.isShared():
+                vid = variantIdToName(d.getVariantId())
+                installCmds.append(textwrap.dedent("""\
+                # {PACKAGE}
+                if [ ! -d {SHARED}/{VID1}/{VID2} ] ; then
+                    mkdir -p {SHARED}
+                    T=$(mktemp -d -p {SHARED})
+                    tar xf {TGZ} -C $T meta/audit.json.gz content/
+                    cp {BUILDID} $T/meta/buildid.bin
+                    mkdir -p {SHARED}/{VID1}
+                    mv -T $T {SHARED}/{VID1}/{VID2} || rm -rf $T
+                fi
+                """.format(TGZ=JenkinsJob._tgzName(d),
+                           VID1=vid[0:2], VID2=vid[2:],
+                           BUILDID=JenkinsJob._buildIdName(d),
+                           SHARED=sharedDir,
+                           PACKAGE="/".join(d.getPackage().getStack()))))
+        if installCmds:
+            installCmds[0:0] = [ self.getShebang(windows), "",
+                "# install shared package atomically",
+                "# =================================", ""]
+            ret["install"] = "\n".join(installCmds)
+
+        return ret
+
     def dumpXML(self, orig, nodes, windows, credentials, clean, options, date, authtoken):
+        spec = self._getSpec(windows, options)
         if orig:
             root = xml.etree.ElementTree.fromstring(orig)
             builders = root.find("builders")
@@ -512,169 +742,78 @@ class JenkinsJob:
         xml.etree.ElementTree.SubElement(
             scmTrigger, "ignorePostCommitHooks").text = "false"
 
-        sharedDir = options.get("shared.dir", "${JENKINS_HOME}/bob")
-
-        prepareCmds = []
-        prepareCmds.append(self.getShebang(windows))
-        prepareCmds.append("mkdir -p .state")
-        if not windows:
-            # Verify umask for predictable file modes. Can be set outside of
-            # Jenkins but Bob requires that umask is everywhere the same for
-            # stable Build-IDs. Mask 0022 is enforced on local builds and in
-            # the sandbox. Check it and bail out if different.
-            prepareCmds.append("[[ $(umask) == 0022 ]] || exit 1")
-
-        prepareCmds.append("")
-        prepareCmds.append("# delete unused files and directories from workspace")
-        prepareCmds.append("pruneUnused()")
-        prepareCmds.append("{")
-        prepareCmds.append("   set +x")
-        prepareCmds.append("   local i key value")
-        prepareCmds.append("   declare -A allowed")
-        prepareCmds.append("")
-        prepareCmds.append("   for i in \"$@\" ; do")
-        prepareCmds.append("          key=\"${i%%/*}\"")
-        prepareCmds.append("          value=\"${i:$((${#key} + 1))}\"")
-        prepareCmds.append("          allowed[\"$key\"]=\"${allowed[\"$key\"]+${allowed[\"$key\"]} }${value}\"")
-        prepareCmds.append("   done")
-        prepareCmds.append("")
-        prepareCmds.append("   for i in * ; do")
-        prepareCmds.append("          if [[ ${allowed[\"$i\"]+true} ]] ; then")
-        prepareCmds.append("              if [[ ! -z ${allowed[\"$i\"]} && -d $i ]] ; then")
-        prepareCmds.append("                  pushd \"$i\" > /dev/null")
-        prepareCmds.append("                  pruneUnused ${allowed[\"$i\"]}")
-        prepareCmds.append("                  popd > /dev/null")
-        prepareCmds.append("              fi")
-        prepareCmds.append("          elif [[ -e \"$i\" ]] ; then")
-        prepareCmds.append("              echo \"Remove $PWD/$i\"")
-        prepareCmds.append("              chmod -R u+rw \"$i\"")
-        prepareCmds.append("              rm -rf \"$i\"")
-        prepareCmds.append("          fi")
-        prepareCmds.append("   done")
-        prepareCmds.append("}")
-        prepareCmds.append("")
-        whiteList = []
-        whiteList.extend([ JenkinsJob._tgzName(d) for d in self.__deps.values()])
-        whiteList.extend([ JenkinsJob._buildIdName(d) for d in self.__deps.values()])
-        whiteList.extend([ d.getWorkspacePath() for d in self.__checkoutSteps.values() ])
-        whiteList.extend([ d.getWorkspacePath() for d in self.__buildSteps.values() ])
-        prepareCmds.extend(wrapCommandArguments("pruneUnused", sorted(whiteList)))
-        prepareCmds.append("set -x")
-
-        deps = sorted(self.__deps.values())
-        if deps:
+        # trigger on dependencies
+        if spec["upstreamProjects"]:
             revBuild = xml.etree.ElementTree.SubElement(
                 triggers, "jenkins.triggers.ReverseBuildTrigger")
             xml.etree.ElementTree.SubElement(revBuild, "spec").text = ""
             xml.etree.ElementTree.SubElement(
-                revBuild, "upstreamProjects").text = ", ".join(
-                    [ self.__getJobName(d) for d in deps ])
+                revBuild, "upstreamProjects").text = ", ".join(spec["upstreamProjects"])
             threshold = xml.etree.ElementTree.SubElement(revBuild, "threshold")
             xml.etree.ElementTree.SubElement(threshold, "name").text = "SUCCESS"
             xml.etree.ElementTree.SubElement(threshold, "ordinal").text = "0"
             xml.etree.ElementTree.SubElement(threshold, "color").text = "BLUE"
             xml.etree.ElementTree.SubElement(threshold, "completeBuild").text = "true"
 
-            # copy deps into workspace
-            for d in deps:
-                if d.isShared():
-                    vid = variantIdToName(d.getVariantId())
-                    guard = xml.etree.ElementTree.SubElement(
-                        builders, "org.jenkinsci.plugins.conditionalbuildstep.singlestep.SingleConditionalBuilder", attrib={
-                            "plugin" : "conditional-buildstep@1.3.3",
-                        })
-                    notCond = xml.etree.ElementTree.SubElement(
-                        guard, "condition", attrib={
-                            "class" : "org.jenkins_ci.plugins.run_condition.logic.Not",
-                            "plugin" : "run-condition@1.0",
-                        })
-                    fileCond = xml.etree.ElementTree.SubElement(
-                        notCond, "condition", attrib={
-                            "class" : "org.jenkins_ci.plugins.run_condition.core.FileExistsCondition"
-                        })
-                    xml.etree.ElementTree.SubElement(
-                        fileCond, "file").text = sharedDir+"/"+vid[0:2]+"/"+vid[2:]
-                    xml.etree.ElementTree.SubElement(
-                        fileCond, "baseDir", attrib={
-                            "class" : "org.jenkins_ci.plugins.run_condition.common.BaseDirectory$Workspace"
-                        })
-                    cp = xml.etree.ElementTree.SubElement(
-                        guard, "buildStep", attrib={
-                            "class" : "hudson.plugins.copyartifact.CopyArtifact",
-                            "plugin" : "copyartifact@1.32.1",
-                        })
-                    xml.etree.ElementTree.SubElement(
-                        guard, "runner", attrib={
-                            "class" : "org.jenkins_ci.plugins.run_condition.BuildStepRunner$Fail",
-                            "plugin" : "run-condition@1.0",
-                        })
-                else:
-                    cp = xml.etree.ElementTree.SubElement(
-                        builders, "hudson.plugins.copyartifact.CopyArtifact", attrib={
-                            "plugin" : "copyartifact@1.32.1"
-                        })
-                xml.etree.ElementTree.SubElement(
-                    cp, "project").text = self.__getJobName(d)
-                xml.etree.ElementTree.SubElement(
-                    cp, "filter").text = JenkinsJob._tgzName(d)+","+JenkinsJob._buildIdName(d)
-                xml.etree.ElementTree.SubElement(
-                    cp, "target").text = ""
-                xml.etree.ElementTree.SubElement(
-                    cp, "excludes").text = ""
-                xml.etree.ElementTree.SubElement(
-                    cp, "selector", attrib={
-                        "class" : "hudson.plugins.copyartifact.StatusBuildSelector"
+        # copy deps into workspace
+        for d in spec["inputArtifacts"]:
+            if d["condition"]:
+                guard = xml.etree.ElementTree.SubElement(
+                    builders, "org.jenkinsci.plugins.conditionalbuildstep.singlestep.SingleConditionalBuilder", attrib={
+                        "plugin" : "conditional-buildstep@1.3.3",
+                    })
+                notCond = xml.etree.ElementTree.SubElement(
+                    guard, "condition", attrib={
+                        "class" : "org.jenkins_ci.plugins.run_condition.logic.Not",
+                        "plugin" : "run-condition@1.0",
+                    })
+                fileCond = xml.etree.ElementTree.SubElement(
+                    notCond, "condition", attrib={
+                        "class" : "org.jenkins_ci.plugins.run_condition.core.FileExistsCondition"
                     })
                 xml.etree.ElementTree.SubElement(
-                    cp, "doNotFingerprintArtifacts").text = "true"
-
-            # extract deps
-            prepareCmds.append("\n# extract deps\n# ============")
-            for d in deps:
-                if d.isShared():
-                    vid = variantIdToName(d.getVariantId())
-                    prepareCmds.append("")
-                    prepareCmds.append(textwrap.dedent("""\
-                        # {PACKAGE}
-                        if [ ! -d {SHARED}/{VID1}/{VID2} ] ; then
-                            mkdir -p {SHARED}
-                            T=$(mktemp -d -p {SHARED})
-                            tar xf {TGZ} -C $T meta/audit.json.gz content/
-                            cp {BUILDID} $T/meta/buildid.bin
-                            mkdir -p {SHARED}/{VID1}
-                            mv -T $T {SHARED}/{VID1}/{VID2} || rm -rf $T
-                        fi
-                        mkdir -p {WSP_DIR}
-                        ln -sfT {SHARED}/{VID1}/{VID2}/content {WSP_PATH}
-                        ln -sfT {SHARED}/{VID1}/{VID2}/meta/audit.json.gz {AUDIT}
-                        ln -sfT {SHARED}/{VID1}/{VID2}/meta/buildid.bin {BUILDID}
-                        """.format(VID1=vid[0:2], VID2=vid[2:], TGZ=JenkinsJob._tgzName(d),
-                                   WSP_DIR=os.path.dirname(d.getWorkspacePath()),
-                                   WSP_PATH=d.getWorkspacePath(),
-                                   SHARED=sharedDir,
-                                   AUDIT=JenkinsJob._auditName(d),
-                                   BUILDID=JenkinsJob._buildIdName(d),
-                                   PACKAGE="/".join(d.getPackage().getStack()))))
-                else:
-                    prepareCmds.append("mkdir -p " + d.getWorkspacePath())
-                    prepareCmds.append(
-                        "tar xf {TGZ} --transform='s|^meta/audit.json.gz|{AUDIT}|' --transform=\"s|^content|{WSP_PATH}|\" meta/audit.json.gz content/".format(
-                        TGZ=JenkinsJob._tgzName(d),
-                        AUDIT=JenkinsJob._auditName(d),
-                        WSP_PATH=d.getWorkspacePath()))
-
-        prepare = xml.etree.ElementTree.SubElement(builders, "hudson.tasks.Shell")
-        xml.etree.ElementTree.SubElement(prepare, "command").text = "\n".join(
-            prepareCmds)
-
-        # checkout steps
-        checkoutSCMs = []
-        for d in sorted(self.__checkoutSteps.values()):
-            if d.getJenkinsScript() is not None:
-                checkout = xml.etree.ElementTree.SubElement(
-                    builders, "hudson.tasks.Shell")
+                    fileCond, "file").text = d["condition"]
                 xml.etree.ElementTree.SubElement(
-                    checkout, "command").text = self.dumpStep(d, windows, [])
+                    fileCond, "baseDir", attrib={
+                        "class" : "org.jenkins_ci.plugins.run_condition.common.BaseDirectory$Workspace"
+                    })
+                cp = xml.etree.ElementTree.SubElement(
+                    guard, "buildStep", attrib={
+                        "class" : "hudson.plugins.copyartifact.CopyArtifact",
+                        "plugin" : "copyartifact@1.32.1",
+                    })
+                xml.etree.ElementTree.SubElement(
+                    guard, "runner", attrib={
+                        "class" : "org.jenkins_ci.plugins.run_condition.BuildStepRunner$Fail",
+                        "plugin" : "run-condition@1.0",
+                    })
+            else:
+                cp = xml.etree.ElementTree.SubElement(
+                    builders, "hudson.plugins.copyartifact.CopyArtifact", attrib={
+                        "plugin" : "copyartifact@1.32.1"
+                    })
+            xml.etree.ElementTree.SubElement(
+                cp, "project").text = d["project"]
+            xml.etree.ElementTree.SubElement(
+                cp, "filter").text = d["filter"]
+            xml.etree.ElementTree.SubElement(
+                cp, "target").text = ""
+            xml.etree.ElementTree.SubElement(
+                cp, "excludes").text = ""
+            xml.etree.ElementTree.SubElement(
+                cp, "selector", attrib={
+                    "class" : "hudson.plugins.copyartifact.StatusBuildSelector"
+                })
+            xml.etree.ElementTree.SubElement(
+                cp, "doNotFingerprintArtifacts").text = "true"
+
+        # prepare stage
+        prepare = xml.etree.ElementTree.SubElement(builders, "hudson.tasks.Shell")
+        xml.etree.ElementTree.SubElement(prepare, "command").text = spec["prepare"]
+
+        # checkout scms
+        checkoutSCMs = []
+        for d in spec["scms"]:
             checkoutSCMs.extend(d.getJenkinsXml(credentials, options))
 
         if len(checkoutSCMs) > 1:
@@ -694,119 +833,55 @@ class JenkinsJob:
             scm = xml.etree.ElementTree.SubElement(
                 root, "scm", attrib={"class" : "hudson.scm.NullSCM"})
 
+        # checkout scripts
+        for d in spec["checkout"]:
+            checkout = xml.etree.ElementTree.SubElement(
+                builders, "hudson.tasks.Shell")
+            xml.etree.ElementTree.SubElement(
+                checkout, "command").text = d
+
         # calculate Build-ID
-        buildIdCalc = [
-            self.getShebang(windows),
-            "# create build-ids"
-        ]
-        for d in sorted(self.__checkoutSteps.values()):
-            buildIdCalc.extend(self.dumpStepBuildIdGen(d))
-        for d in sorted(self.__buildSteps.values()):
-            buildIdCalc.extend(self.dumpStepBuildIdGen(d))
-        for d in sorted(self.__packageSteps.values()):
-            buildIdCalc.extend(self.dumpStepBuildIdGen(d))
-        checkout = xml.etree.ElementTree.SubElement(
-            builders, "hudson.tasks.Shell")
-        xml.etree.ElementTree.SubElement(
-            checkout, "command").text = "\n".join(buildIdCalc)
+        if spec["buildIdCalc"]:
+            checkout = xml.etree.ElementTree.SubElement(
+                builders, "hudson.tasks.Shell")
+            xml.etree.ElementTree.SubElement(
+                checkout, "command").text = spec["buildIdCalc"]
 
         # generate audit trail of checkout steps
-        if self.__checkoutSteps:
-            checkoutAudit = [
-                self.getShebang(windows),
-                "# generate audit trail of checkout step(s)"
-            ]
-            for d in sorted(self.__checkoutSteps.values()):
-                checkoutAudit.append(self.dumpStepAuditGen(d))
+        if spec["auditCalc"]:
             audit = xml.etree.ElementTree.SubElement(
                 builders, "hudson.tasks.Shell")
             xml.etree.ElementTree.SubElement(
-                audit, "command").text = "\n".join(checkoutAudit)
+                audit, "command").text = spec["auditCalc"]
 
         # download if possible
-        downloadCmds = []
-        for d in sorted(self.__packageSteps.values()):
-            # only download tools if built in sandbox
-            if d.doesProvideTools() and (d.getSandbox() is None):
-                continue
-            cmd = self.__archive.download(d, JenkinsJob._buildIdName(d), JenkinsJob._tgzName(d))
-            if not cmd: continue
-            downloadCmds.append(cmd)
-        if downloadCmds:
-            downloadCmds.insert(0, self.getShebang(windows, False))
-            downloadCmds.append("true # don't let downloads fail the build")
+        if spec["download"]:
             download = xml.etree.ElementTree.SubElement(
                 builders, "hudson.tasks.Shell")
             xml.etree.ElementTree.SubElement(
-                download, "command").text = "\n".join(downloadCmds)
+                download, "command").text = spec["download"]
 
         # build steps
-        for d in sorted(self.__buildSteps.values()):
+        for d in spec["build"]:
             build = xml.etree.ElementTree.SubElement(
                 builders, "hudson.tasks.Shell")
-            affectedPackageSteps = [ pkgStep for pkgStep in self.__packageSteps.values()
-                if d in pkgStep.getArguments() ]
-            xml.etree.ElementTree.SubElement(
-                build, "command").text = "\n".join([
-                    self.dumpStep(d, windows, affectedPackageSteps),
-                    "", "# generate audit trail",
-                    "cd $WORKSPACE",
-                    self.dumpStepAuditGen(d)
-                ])
+            xml.etree.ElementTree.SubElement(build, "command").text = d
 
         # package steps
-        publish = []
-        for d in sorted(self.__packageSteps.values()):
+        for d in spec["package"]:
             package = xml.etree.ElementTree.SubElement(
                 builders, "hudson.tasks.Shell")
-            xml.etree.ElementTree.SubElement(package, "command").text = "\n".join([
-                self.dumpStep(d, windows, [d]),
-                "", "# generate audit trail",
-                "cd $WORKSPACE",
-                self.dumpStepAuditGen(d),
-                "", "# pack result for archive and inter-job exchange",
-                "cd $WORKSPACE",
-                "tar zcfv {TGZ} -H pax --pax-option=\"bob-archive-vsn=1\" --transform='s|^{AUDIT}|meta/audit.json.gz|' --transform='s|^{WSP_PATH}|content|' {AUDIT} {WSP_PATH}".format(
-                    TGZ=JenkinsJob._tgzName(d),
-                    AUDIT=JenkinsJob._auditName(d),
-                    WSP_PATH=d.getWorkspacePath()),
-                "" if d.doesProvideTools() and (d.getSandbox() is None)
-                    else self.__archive.upload(d, JenkinsJob._buildIdName(d), JenkinsJob._tgzName(d))
-            ])
-            publish.append(JenkinsJob._tgzName(d))
-            publish.append(JenkinsJob._buildIdName(d))
+            xml.etree.ElementTree.SubElement(package, "command").text = d
 
         # install shared packages
-        installCmds = []
-        for d in sorted(self.__packageSteps.values()):
-            if d.isShared():
-                vid = variantIdToName(d.getVariantId())
-                installCmds.append(textwrap.dedent("""\
-                # {PACKAGE}
-                if [ ! -d {SHARED}/{VID1}/{VID2} ] ; then
-                    mkdir -p {SHARED}
-                    T=$(mktemp -d -p {SHARED})
-                    tar xf {TGZ} -C $T meta/audit.json.gz content/
-                    cp {BUILDID} $T/meta/buildid.bin
-                    mkdir -p {SHARED}/{VID1}
-                    mv -T $T {SHARED}/{VID1}/{VID2} || rm -rf $T
-                fi
-                """.format(TGZ=JenkinsJob._tgzName(d),
-                           VID1=vid[0:2], VID2=vid[2:],
-                           BUILDID=JenkinsJob._buildIdName(d),
-                           SHARED=sharedDir,
-                           PACKAGE="/".join(d.getPackage().getStack()))))
-        if installCmds:
-            installCmds[0:0] = [ self.getShebang(windows), "",
-                "# install shared package atomically",
-                "# =================================", ""]
+        if spec["install"]:
             install = xml.etree.ElementTree.SubElement(
                 builders, "hudson.tasks.Shell")
             xml.etree.ElementTree.SubElement(
-                install, "command").text = "\n".join(installCmds)
+                install, "command").text = spec["install"]
 
         xml.etree.ElementTree.SubElement(
-            archiver, "artifacts").text = ",".join(publish)
+            archiver, "artifacts").text = ",".join(spec["outputArtifacts"])
         xml.etree.ElementTree.SubElement(
             archiver, "allowEmptyArchive").text = "false"
 
