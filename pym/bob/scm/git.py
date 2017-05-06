@@ -191,6 +191,44 @@ fi
 
         return scm
 
+    def asJenkinsPipeline(self, workPath, credentials, options):
+        if self.__commit:
+            branch = self.__commit
+        elif self.__tag:
+            branch = "refs/tags/" + self.__tag
+        else:
+            branch = "refs/heads/" + self.__branch
+
+        userconfigs = [ "url: '{}'".format(self.__url) ]
+        if credentials:
+            userconfigs.append("credentialsId: '{}'".format(credentials))
+
+        extensions = [
+            "[$class: 'RelativeTargetDirectory', relativeTargetDir: '{}']".format(
+                os.path.normpath(os.path.join(workPath, self.__dir))),
+            "[$class: 'CleanCheckout']",
+        ]
+        shallow = options.get("scm.git.shallow")
+        if shallow is not None:
+            try:
+                shallow = int(shallow)
+                if shallow < 0: raise ValueError()
+            except ValueError:
+                raise BuildError("Invalid 'git.shallow' option: " + str(shallow))
+            if shallow > 0:
+                extensions.append("[$class: 'CloneOption', depth: {}, noTags: false, reference: '', shallow: true]".format(shallow))
+
+        return """checkout([
+            $class: 'GitSCM',
+            branches: [[name: '{BRANCH}']],
+            doGenerateSubmoduleConfigurations: false,
+            extensions: [{EXTENSIONS}],
+            submoduleCfg: [],
+            userRemoteConfigs: [[{CFG}]]
+        ])""".format(BRANCH=branch, EXTENSIONS=", ".join(extensions),
+                     CFG=", ".join(userconfigs))
+
+
     def merge(self, other):
         return False
 

@@ -1194,6 +1194,11 @@ class CheckoutStep(Step):
         return [ s.asJenkins(self.getWorkspacePath(), credentials, options)
                  for s in self._coreStep.scmList if s.hasJenkinsPlugin() ]
 
+    def getJenkinsPipeline(self, credentials, options):
+        return "\n".join(
+            s.asJenkinsPipeline(self.getWorkspacePath(), credentials, options)
+            for s in self._coreStep.scmList if s.hasJenkinsPlugin())
+
     def getScmList(self):
         return self._coreStep.scmList
 

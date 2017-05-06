@@ -58,6 +58,9 @@ def variantIdToName(vid):
     """Convert to name in shared location"""
     return asHexStr(vid) + SHARED_GENERATION
 
+def pipelineShStep(s):
+    return "sh '''" + s.translate({ ord('\\') : "\\\\", ord("'") : "\\'" }) + "'''"
+
 class Wiper:
     def __init__(self):
         self.mode = 0
@@ -659,6 +662,15 @@ class JenkinsJob:
         return ret
 
     def dumpXML(self, orig, nodes, windows, credentials, clean, options, date, authtoken):
+        jobType = options.get("jobs.type", "freestyle")
+        if jobType == "freestyle":
+            return self.dumpXMLFreeStyle(orig, nodes, windows, credentials, clean, options, date, authtoken)
+        elif jobType == "pipeline":
+            return self.dumpXMLPipeline(orig, nodes, windows, credentials, clean, options, date, authtoken)
+        else:
+            raise ParseError("Invalid jenkins job type: " + jobType)
+
+    def dumpXMLFreeStyle(self, orig, nodes, windows, credentials, clean, options, date, authtoken):
         spec = self._getSpec(windows, options)
         if orig:
             root = xml.etree.ElementTree.fromstring(orig)
@@ -902,6 +914,163 @@ class JenkinsJob:
 
         return xml.etree.ElementTree.tostring(root, encoding="UTF-8")
 
+    def dumpXMLPipeline(self, orig, nodes, windows, credentials, clean, options, date, authtoken):
+        spec = self._getSpec(windows, options)
+        if orig:
+            root = xml.etree.ElementTree.fromstring(orig)
+            pipelineScript = root.find("definition/script")
+            pipelineScript.clear()
+            triggers = root.find("properties/org.jenkinsci.plugins.workflow.job.properties.PipelineTriggersJobProperty/triggers")
+            revBuild = triggers.find("jenkins.triggers.ReverseBuildTrigger")
+            if revBuild is not None: triggers.remove(revBuild)
+            scmTrigger = triggers.find("hudson.triggers.SCMTrigger")
+            if scmTrigger is not None: triggers.remove(scmTrigger)
+            auth = root.find("authToken")
+            if auth:
+                if not authtoken:
+                    xml.etree.ElementTree.remove(auth)
+                else:
+                    auth.clear()
+            else:
+                if authtoken:
+                    xml.etree.ElementTree.SubElement(root, "authToken")
+        else:
+            root = xml.etree.ElementTree.Element("flow-definition",
+                attrib = {"plugin" : "workflow-job@2.10"})
+            xml.etree.ElementTree.SubElement(root, "actions")
+            xml.etree.ElementTree.SubElement(root, "description")
+            if self.__name != self.__displayName:
+                xml.etree.ElementTree.SubElement(
+                    root, "displayName").text = self.__displayName
+            xml.etree.ElementTree.SubElement(root, "keepDependencies").text = "false"
+            properties = xml.etree.ElementTree.SubElement(root, "properties")
+            triggers = xml.etree.ElementTree.SubElement(
+                xml.etree.ElementTree.SubElement(properties,
+                    "org.jenkinsci.plugins.workflow.job.properties.PipelineTriggersJobProperty"),
+                "triggers")
+            if not self.__isRoot:
+                # only retain one artifact per non-root job
+                discard = xml.etree.ElementTree.fromstring("""
+                    <jenkins.model.BuildDiscarderProperty>
+                      <strategy class="hudson.tasks.LogRotator">
+                        <daysToKeep>-1</daysToKeep>
+                        <numToKeep>-1</numToKeep>
+                        <artifactDaysToKeep>-1</artifactDaysToKeep>
+                        <artifactNumToKeep>1</artifactNumToKeep>
+                      </strategy>
+                    </jenkins.model.BuildDiscarderProperty>""")
+                properties.append(discard)
+            definition = xml.etree.ElementTree.SubElement(root, "definition", attrib={
+                "class" : "org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition",
+                "plugin": "workflow-cps@2.30"
+            })
+            pipelineScript = xml.etree.ElementTree.SubElement(definition, "script")
+            xml.etree.ElementTree.SubElement(definition, "sandbox").text = "true"
+            if authtoken:
+                auth = xml.etree.ElementTree.SubElement(root, "authToken")
+            else:
+                auth = None
+
+        # basic stuff
+        root.find("description").text = self.getDescription(date)
+        scmTrigger = xml.etree.ElementTree.SubElement(
+            triggers, "hudson.triggers.SCMTrigger")
+        xml.etree.ElementTree.SubElement(scmTrigger, "spec").text = options.get("scm.poll")
+        xml.etree.ElementTree.SubElement(
+            scmTrigger, "ignorePostCommitHooks").text = "false"
+
+        # add authtoken if set in options
+        if auth:
+            auth.text = authtoken
+
+        # trigger on dependencies
+        if spec["upstreamProjects"]:
+            revBuild = xml.etree.ElementTree.SubElement(
+                triggers, "jenkins.triggers.ReverseBuildTrigger")
+            xml.etree.ElementTree.SubElement(revBuild, "spec").text = ""
+            xml.etree.ElementTree.SubElement(
+                revBuild, "upstreamProjects").text = ", ".join(spec["upstreamProjects"])
+            threshold = xml.etree.ElementTree.SubElement(revBuild, "threshold")
+            xml.etree.ElementTree.SubElement(threshold, "name").text = "SUCCESS"
+            xml.etree.ElementTree.SubElement(threshold, "ordinal").text = "0"
+            xml.etree.ElementTree.SubElement(threshold, "color").text = "BLUE"
+            xml.etree.ElementTree.SubElement(threshold, "completeBuild").text = "true"
+
+        pipeline = [ ]
+
+        # copy in artifacts and prepare build
+        pipeline.append('stage("Prepare") {')
+        if clean:
+            pipeline.append('deleteDir')
+        for d in spec["inputArtifacts"]:
+            cmd = """step([$class: 'CopyArtifact',
+                projectName: '{PROJECT}',
+                filter: '{FILTER}',
+                fingerprintArtifacts: false
+            ]);""".format(PROJECT=d["project"], FILTER=d["filter"])
+
+            if d["condition"]:
+                pipeline.append("if (!fileExists(\"" + d["condition"] + "\")) {")
+                pipeline.append(cmd)
+                pipeline.append('}')
+            else:
+                pipeline.append(cmd)
+        pipeline.append(pipelineShStep(spec["prepare"]))
+        pipeline.append('}')
+
+        # checkout
+        if spec["scms"] or spec["checkout"]:
+            pipeline.append('stage("Checkout") {')
+            for d in spec["scms"]:
+                d = d.getJenkinsPipeline(credentials, options)
+                if d: pipeline.append(d)
+            for d in spec["checkout"]:
+                pipeline.append(pipelineShStep(d))
+            pipeline.append('}')
+
+        if spec["buildIdCalc"]:
+            pipeline.append('stage("Build-Id calculation") {')
+            pipeline.append(pipelineShStep(spec["buildIdCalc"]))
+            pipeline.append('}')
+
+        if spec["auditCalc"]:
+            pipeline.append('stage("Audit-Trail generation") {')
+            pipeline.append(pipelineShStep(spec["auditCalc"]))
+            pipeline.append('}')
+
+        if spec["download"]:
+            pipeline.append('stage("Download") {')
+            pipeline.append(pipelineShStep(spec["download"]))
+            pipeline.append('}')
+
+        if spec["build"]:
+            pipeline.append('stage("Build") {')
+            for d in spec["build"]:
+                pipeline.append(pipelineShStep(d))
+            pipeline.append('}')
+
+        if spec["package"]:
+            pipeline.append('stage("Package") {')
+            for d in spec["package"]:
+                pipeline.append(pipelineShStep(d))
+            pipeline.append('}')
+
+        if spec["install"]:
+            pipeline.append('stage("Install shared packages") {')
+            pipeline.append(pipelineShStep(spec["download"]))
+            pipeline.append('}')
+
+        pipeline.append('stage("Archive") {')
+        pipeline.append("    archiveArtifacts '{}'".format(",".join(spec["outputArtifacts"])))
+        pipeline.append('}')
+
+        # wrap into a node
+        # FIXME: handle node property
+        pipeline.insert(0, "node {")
+        pipeline.append("}")
+
+        pipelineScript.text = "\n".join(pipeline)
+        return xml.etree.ElementTree.tostring(root, encoding="UTF-8")
 
     def dumpGraph(self, done):
         for d in self.__deps.values():
