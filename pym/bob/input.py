@@ -1273,7 +1273,7 @@ class PackageStep(RegularStep):
 class CorePackage:
     __slots__ = ("name", "recipe", "directDepSteps", "indirectDepSteps",
         "states", "metaEnv", "tools", "sandbox", "checkoutStep", "buildStep", "packageStep",
-        "touchedTools")
+        "touchedTools", "pkgId")
 
     def __init__(self, package, name, recipe, directDepSteps, indirectDepSteps, states, metaEnv):
         self.name = name
@@ -1338,6 +1338,23 @@ class Package(object):
         self.__sandbox = patchSandbox(inputSandbox, corePackage.sandbox, pathFormatter, self)
 
         return self
+
+    def _getId(self):
+        """The package-Id is uniquely representing every package variant.
+
+        On the package level there might be more dependencies than on the step
+        level. Therefore, despite the variant-id of the package step, this id takes
+        all direct and indirect dependencies of the package into accout.
+        """
+        try:
+            ret = self.__corePackage.pkgId
+        except AttributeError:
+            h = hashlib.sha1()
+            h.update(self.getPackageStep().getVariantId())
+            for i in self.getDirectDepSteps(): h.update(i.getPackage()._getId())
+            for i in self.getIndirectDepSteps(): h.update(i.getPackage()._getId())
+            ret = self.__corePackage.pkgId = h.digest()
+        return ret
 
     def _getTouchedTools(self):
         return self.__corePackage.touchedTools

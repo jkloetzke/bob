@@ -297,7 +297,7 @@ class PackageGraph:
         self.pathGrammer = LocationPath
 
     def __buildGraph(self, name, pkg, parent):
-        key = (name, pkg.getPackageStep().getVariantId())
+        key = (name, pkg._getId())
         node = self.graph.get(key)
         if node is not None:
             node.parents.add(parent)
