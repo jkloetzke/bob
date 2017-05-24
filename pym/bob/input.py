@@ -22,6 +22,7 @@ from .tty import colorize, WarnOnce
 from .utils import asHexStr, joinScripts, sliceString, compareVersion, binStat
 from abc import ABCMeta, abstractmethod
 from collections.abc import MutableMapping
+from collections import OrderedDict
 from base64 import b64encode
 from itertools import chain
 from glob import glob
@@ -1686,6 +1687,17 @@ class Recipe(object):
 
         return list(collect(recipeSet.loadYaml(fileName, fileSchema), "", None))
 
+    @staticmethod
+    def createVirtualRoot(recipeSet, roots):
+        recipe = {
+            "depends" : [
+                { "name" : name, "use" : [] } for name in roots
+            ]
+        }
+        ret = Recipe(recipeSet, recipe, "", ".", "/", "/", {})
+        ret.resolveClasses()
+        return ret
+
     def __init__(self, recipeSet, recipe, sourceFile, baseDir, packageName, baseName, properties, anonBaseClass=None):
         self.__recipeSet = recipeSet
         self.__sources = [ sourceFile ] if anonBaseClass is None else []
@@ -2288,7 +2300,6 @@ class RecipeSet:
     def __init__(self):
         self.__defaultEnv = {}
         self.__aliases = {}
-        self.__rootRecipes = []
         self.__recipes = {}
         self.__classes = {}
         self.__whiteList = set(["TERM", "SHELL", "USER", "HOME"])
@@ -2511,6 +2522,7 @@ class RecipeSet:
                     raise
 
         # resolve recipes and their classes
+        rootRecipes = []
         for recipe in self.__recipes.values():
             try:
                 recipe.resolveClasses()
@@ -2518,7 +2530,10 @@ class RecipeSet:
                 e.pushFrame(recipe.getPackageName())
                 raise
             if recipe.isRoot():
-                self.__rootRecipes.append(recipe)
+                rootRecipes.append(recipe.getPackageName())
+
+        # create virtual root package
+        self.__rootRecipe = Recipe.createVirtualRoot(self, sorted(rootRecipes))
 
     def __parseUserConfig(self, fileName):
         cfg = self.loadYaml(fileName, RecipeSet.USER_CONFIG_SCHEMA)
@@ -2674,37 +2689,16 @@ class RecipeSet:
                 if cacheKey == persistedCacheKey:
                     tmp = PackageUnpickler(f, self.getRecipe, self.__plugins,
                                            nameFormatter).load()
-                    result = { name : package.toStep(nameFormatter, rootPkg).getPackage()
-                               for (name, package) in tmp.items() }
-                    return result
+                    return tmp.toStep(nameFormatter, rootPkg).getPackage()
         except (EOFError, OSError, pickle.UnpicklingError):
             pass
 
         # not cached -> calculate packages
-        result = {}
-        try:
-            BobState().setAsynchronous()
-            for root in sorted(self.__rootRecipes, key=lambda p: p.getPackageName()):
-                try:
-                    result[root.getPackageName()] = root.prepare(nameFormatter, env,
-                                                                 sandboxEnabled,
-                                                                 states)[0]
-                except ParseError as e:
-                    e.pushFrame(root.getPackageName())
-                    raise e
-            tmp = result.copy()
-            for i in self.__aliases:
-                try:
-                    p = walkPackagePath(tmp, self.__aliases[i])
-                    result[i] = p
-                except ParseError as e:
-                    print(colorize("Bad alias '{}': {}".format(i, e.slogan), "33"), file=sys.stderr)
-        finally:
-            BobState().setSynchronous()
+        result = self.__rootRecipe.prepare(nameFormatter, env, sandboxEnabled,
+                                           states)[0]
 
         # save package tree for next invocation
-        tmp = { name : CoreStepRef(rootPkg, package.getPackageStep())
-                for (name, package) in result.items() }
+        tmp = CoreStepRef(rootPkg, result.getPackageStep())
         try:
             newCacheName = cacheName + ".new"
             with open(newCacheName, "wb") as f:
@@ -2725,41 +2719,49 @@ class RecipeSet:
         cacheName = ".bob-tree.dbm"
 
         # try to load persisted tree
-        roots = TreeStorage.load(cacheName, cacheKey)
-        if roots is not None:
-            return roots
+        root = TreeStorage.load(cacheName, cacheKey)
+        if root is not None:
+            return root
 
         # generate and convert
-        roots = self.__generatePackages(lambda p, m: "unused", env, cacheKey, sandboxEnabled)
+        root = self.__generatePackages(lambda p, m: "unused", env, cacheKey, sandboxEnabled)
 
         # save tree cache
-        return TreeStorage.create(cacheName, cacheKey, roots)
+        return TreeStorage.create(cacheName, cacheKey, root)
+
+class TreeNode:
+    __slots__ = ['__db', '__key', '__isDirect', '__origin']
+
+    def __init__(self, db, data):
+        self.__db = db
+        self.__key = data[0]
+        self.__isDirect = data[1]
+        self.__origin = data[2]
+
+    @property
+    def node(self):
+        return TreeStorage(self.__db, self.__key)
+
+    @property
+    def uid(self):
+        return self.__key
+
+    @property
+    def direct(self):
+        return self.__isDirect
+
+    @property
+    def origin(self):
+        return self.__origin
 
 
 class TreeStorage:
-    def __init__(self, db, key=b''):
+    __slots__ = ['__db', '__key', '__parents', '__childs']
+
+    def __init__(self, db, key):
         self.__db = db
-        self.__content = pickle.loads(db[key])
-
-    def __contains__(self, key):
-        return key in self.__content
-
-    def __getitem__(self, key):
-        data = self.__content[key]
-        return (TreeStorage(self.__db, data[0]), data[1], data[2])
-
-    def __iter__(self):
-        return iter(self.__content)
-
-    def keys(self):
-        return self.__content.keys()
-
-    def items(self):
-        return iter( (name, (TreeStorage(self.__db, data[0]), data[1], data[2]))
-                     for name, data in self.__content.items() )
-
-    def __len__(self):
-        return len(self.__content)
+        self.__key = key
+        (self.__parents, self.__childs) = pickle.loads(db[key])
 
     @classmethod
     def load(cls, cacheName, cacheKey):
@@ -2767,7 +2769,7 @@ class TreeStorage:
             db = dbm.open(cacheName, "r")
             persistedCacheKey = db.get('vsn')
             if cacheKey == persistedCacheKey:
-                return cls(db)
+                return cls(db, db['root'])
             else:
                 db.close()
         except OSError:
@@ -2777,47 +2779,85 @@ class TreeStorage:
         return None
 
     @classmethod
-    def create(cls, cacheName, cacheKey, roots):
+    def create(cls, cacheName, cacheKey, root):
         try:
             db = dbm.open(cacheName, 'n')
             try:
-                TreeStorage.__convertRootToTree(db, roots)
+                db['root'] = rootKey = TreeStorage.__convertPackageToTree(db, root)
                 db['vsn'] = cacheKey
             finally:
                 db.close()
-            return cls(dbm.open(cacheName, 'r'))
+            return cls(dbm.open(cacheName, 'r'), rootKey)
         except OSError as e:
             raise ParseError("Error saving internal state: " + str(e))
 
-    @staticmethod
-    def __convertRootToTree(db, roots):
-        root = {}
-        for (name, pkg) in roots.items():
-            pkgId = pkg.getPackageStep()._getResultId()
-            root[name] = (pkgId, True, "")
-            if pkgId not in db:
-                TreeStorage.__convertPackageToTree(db, pkgId, pkg)
-        db[b''] = pickle.dumps(root, -1)
+    @property
+    def uid(self):
+        return self.__key
+
+    @property
+    def parents(self):
+        return self.__parents
+
+    @property
+    def childs(self):
+        return set(i.uid for i in self.__childs.keys())
+
+    def getParent(self, key):
+        return TreeStorage(self.__db, key)
+
+    def getChild(self, key):
+        return TreeStorage(self.__db, key)
+
+    def __contains__(self, name):
+        return name in self.__childs
+
+    def __getitem__(self, name):
+        return TreeNode(self.__db, self.__childs[name])
+
+    def __iter__(self):
+        return iter(self.__childs)
+
+    def keys(self):
+        return self.__childs.keys()
+
+    def items(self):
+        return iter( (name, TreeNode(self.__db, child))
+                     for name, child in self.__childs.items() )
+
+    def __len__(self):
+        return len(self.__childs)
+
+    def __addParent(self, parent):
+        if parent not in self.__parents:
+            self.__parents.add(parent)
+            self.__db[self.__key] = pickle.dumps((self.__parents, self.__childs), -1)
 
     @staticmethod
-    def __convertPackageToTree(db, pkgId, pkg):
-        node = {}
-        for d in pkg.getDirectDepSteps():
-            subPkgId = d._getResultId()
-            subPkg = d.getPackage()
-            node[subPkg.getName()] = (subPkgId, True, "")
-            if subPkgId not in db:
-                TreeStorage.__convertPackageToTree(db, subPkgId, subPkg)
-        prefixLen = len("/".join(pkg.getStack()))
-        for d in pkg.getIndirectDepSteps():
-            subPkg = d.getPackage()
-            name = subPkg.getName()
-            if name in node: continue
-            subPkgId = d._getResultId()
-            node[name] = (subPkgId, False, ".." + "/".join(subPkg.getStack())[prefixLen:] )
-            if subPkgId not in db:
-                TreeStorage.__convertPackageToTree(db, subPkgId, subPkg)
-        db[pkgId] = pickle.dumps(node, -1)
+    def __convertPackageToTree(db, pkg, parent=None):
+        key = pkg.getName().encode('utf8') + pkg._getId()
+        if key not in db:
+            # recurse
+            childs = OrderedDict()
+            for d in pkg.getDirectDepSteps():
+                subPkg = d.getPackage()
+                subPkgId = TreeStorage.__convertPackageToTree(db, subPkg, key)
+                childs[subPkg.getName()] = (subPkgId, True, "")
+            prefixLen = len("/".join(pkg.getStack()))
+            for d in pkg.getIndirectDepSteps():
+                subPkg = d.getPackage()
+                subPkgName = subPkg.getName()
+                if subPkgName in childs: continue
+                subPkgId = TreeStorage.__convertPackageToTree(db, subPkg, key)
+                childs[subPkgName] = (subPkgId, False, ".." + "/".join(subPkg.getStack())[prefixLen:] )
+            # create node
+            node = ( (set([parent]) if parent is not None else set()), childs )
+            db[key] = pickle.dumps(node, -1)
+        elif parent is not None:
+            # add as parent
+            TreeStorage(db, key).__addParent(parent)
+
+        return key
 
 
 class YamlCache:

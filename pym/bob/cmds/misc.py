@@ -38,12 +38,12 @@ except UnicodeEncodeError:
 
 
 def doLS(argv, bobRoot):
-    def showTree(packages, showAll, showOrigin, prefix=""):
+    def showTree(package, showAll, showOrigin, prefix=""):
         i = 0
         if showAll:
-            packages = { name : (pkg, origin) for (name, (pkg, direct, origin)) in packages.items() }
+            packages = { name : (child.node, child.origin) for (name, child) in package.items() }
         else:
-            packages = { name : (pkg, origin) for (name, (pkg, direct, origin)) in packages.items() if direct }
+            packages = { name : (child.node, child.origin) for (name, child) in package.items() if child.direct }
         for n,(p,o) in sorted(packages.items()):
             last = (i >= len(packages)-1)
             print("{}{}{}{}".format(prefix, LS_SEP_1 if last else LS_SEP_2, n,
@@ -51,11 +51,11 @@ def doLS(argv, bobRoot):
             showTree(p, showAll, showOrigin, prefix + (LS_SEP_3 if last else LS_SEP_4))
             i += 1
 
-    def showPrefixed(packages, recurse, showAll, showOrigin, stack, level=0):
+    def showPrefixed(package, recurse, showAll, showOrigin, stack, level=0):
         if showAll:
-            packages = { name : (pkg, origin) for (name, (pkg, direct, origin)) in packages.items() }
+            packages = { name : (child.node, child.origin) for (name, child) in package.items() }
         else:
-            packages = { name : (pkg, origin) for (name, (pkg, direct, origin)) in packages.items() if direct }
+            packages = { name : (child.node, child.origin) for (name, child) in package.items() if child.direct }
         for n,(p,o) in sorted(packages.items()):
             newStack = stack[:]
             newStack.append(n)
@@ -102,26 +102,26 @@ def doLS(argv, bobRoot):
 
     showAll = args.all
     showOrigin = args.origin
-    roots = recipes.generateTree(defines, args.sandbox)
+    root = recipes.generateTree(defines, args.sandbox)
     stack = []
     if args.package:
         stack = steps = [ s for s in args.package.split("/") if s != "" ]
         trail = []
         for step in steps:
-            if step not in roots:
+            if step not in root:
                 raise BuildError("Package '{}' not found under '{}'".format(step, "/".join(trail)))
             trail.append(step)
-            roots = roots[step][0]
+            root = root[step].node
     else:
         steps = ["/"]
 
     if args.prefixed:
-        showPrefixed(roots, args.recursive, showAll, showOrigin, stack)
+        showPrefixed(root, args.recursive, showAll, showOrigin, stack)
     elif args.recursive:
         print("/".join(steps))
-        showTree(roots, showAll, showOrigin)
+        showTree(root, showAll, showOrigin)
     else:
-        showPrefixed(roots, False, showAll, showOrigin, [])
+        showPrefixed(root, False, showAll, showOrigin, [])
 
 class Default(dict):
     def __init__(self, default, *args, **kwargs):
