@@ -15,9 +15,12 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 from ..errors import ParseError, BuildError
+from ..stringparser import isTrue
 from ..tty import colorize, WarnOnce
 from ..utils import hashString
 from .scm import Scm, ScmAudit
+from pipes import quote
+from textwrap import dedent
 from xml.etree import ElementTree
 import hashlib
 import os, os.path
@@ -36,7 +39,9 @@ class GitScm(Scm):
         schema.Optional('tag') : str,
         schema.Optional('commit') : str,
         schema.Optional('rev') : str,
+        schema.Optional(schema.Regex('^remote-.*')) : str,
     })
+    REMOTE_PREFIX = "remote-"
 
     def __init__(self, spec, overrides=[]):
         super().__init__(overrides)
@@ -45,6 +50,7 @@ class GitScm(Scm):
         self.__branch = None
         self.__tag = None
         self.__commit = None
+        self.__remotes = {}
         if "rev" in spec:
             rev = spec["rev"]
             if rev.startswith("refs/heads/"):
@@ -66,9 +72,16 @@ class GitScm(Scm):
             # nothing secified at all -> master branch
             self.__branch = "master"
         self.__dir = spec.get("dir", ".")
+        # convert remotes into separate dictionary
+        for key, val in spec.items():
+            if key.startswith(GitScm.REMOTE_PREFIX):
+                stripped_key = key[len(GitScm.REMOTE_PREFIX):] # remove prefix
+                if stripped_key == "origin":
+                    raise ParseError("Invalid remote name: " + stripped_key)
+                self.__remotes.update({stripped_key : val})
 
     def getProperties(self):
-        return [{
+        properties = [{
             'recipe' : self.__recipe,
             'scm' : 'git',
             'url' : self.__url,
@@ -81,42 +94,85 @@ class GitScm(Scm):
                     ("refs/heads/" + self.__branch))
             )
         }]
+        for key, val in self.__remotes.items():
+            properties[0].update({GitScm.REMOTE_PREFIX+key : val})
+        return properties
 
     def asScript(self):
+        remotes_array = [
+            "# create an array of all remotes for this repository",
+            "declare -A BOB_GIT_REMOTES=( [origin]={URL} )".format(URL=quote(self.__url)),
+        ]
+        # add additional remotes to array
+        for name, url in self.__remotes.items():
+            remotes_array.append("BOB_GIT_REMOTES[{NAME}]={URL}"
+                                    .format(NAME=quote(name), URL=quote(url)))
+        # create script to handle remotes
+        remotes_script = dedent("""\
+            (
+                {REMOTES_ARRAY}
+                # remove remotes from array that are already known to Git
+                while read -r REMOTE_NAME ; do
+                    # check for empty variable in case no remote at all is specified
+                    if [ -z "$REMOTE_NAME" ]; then
+                        continue
+                    fi
+                    # check if existing remote is configured
+                    if [ "${{BOB_GIT_REMOTES[$REMOTE_NAME]+_}}" ]; then
+                        # check if URL has changed
+                        if [ ! "${{BOB_GIT_REMOTES[$REMOTE_NAME]}}" == "$(git ls-remote --get-url $REMOTE_NAME)" ]; then
+                            git remote set-url "$REMOTE_NAME" "${{BOB_GIT_REMOTES[$REMOTE_NAME]}}"
+                        fi
+                        # it is configured, therefore no need to keep in list
+                        unset "BOB_GIT_REMOTES[$REMOTE_NAME]"
+                    fi
+                done <<< "$(git remote)"
+                # add all remaining remotes in the array to the repository
+                for REMOTE_NAME in "${{!BOB_GIT_REMOTES[@]}}" ; do
+                    git remote add "$REMOTE_NAME" "${{BOB_GIT_REMOTES[$REMOTE_NAME]}}"
+                done
+            )""").format(REMOTES_ARRAY="\n    ".join(remotes_array))
+
         if self.__tag or self.__commit:
-            return """
-export GIT_SSL_NO_VERIFY=true
-if [ ! -d {DIR}/.git ] ; then
-    git init {DIR}
-fi
-cd {DIR}
-# see if we have a remote
-if [[ -z $(git remote) ]] ; then
-    git remote add origin {URL}
-fi
-# checkout only if HEAD is invalid
-if ! git rev-parse --verify -q HEAD >/dev/null ; then
-    git fetch -t origin '+refs/heads/*:refs/remotes/origin/*'
-    git checkout -q {REF}
-fi
-""".format(URL=self.__url, REF=self.__commit if self.__commit else "tags/"+self.__tag, DIR=self.__dir)
+            return dedent("""\
+                export GIT_SSL_NO_VERIFY=true
+                if [ ! -d {DIR}/.git ] ; then
+                    git init {DIR}
+                fi
+                cd {DIR}
+                {REMOTES}
+                # checkout only if HEAD is invalid
+                if ! git rev-parse --verify -q HEAD >/dev/null ; then
+                    git fetch -t origin '+refs/heads/*:refs/remotes/origin/*'
+                    git checkout -q {REF}
+                fi
+                """).format(URL=self.__url,
+                            REF=self.__commit if self.__commit else "tags/"+self.__tag,
+                            DIR=self.__dir,
+                            REMOTES=remotes_script)
         else:
-            return """
-export GIT_SSL_NO_VERIFY=true
-if [ -d {DIR}/.git ] ; then
-    cd {DIR}
-    if [[ $(git rev-parse --abbrev-ref HEAD) == "{BRANCH}" ]] ; then
-        git pull --ff-only
-    else
-        echo "Warning: not updating {DIR} because branch was changed manually..." >&2
-    fi
-else
-    if ! git clone -b {BRANCH} {URL} {DIR} ; then
-        rm -rf {DIR}/.git {DIR}/*
-        exit 1
-    fi
-fi
-""".format(URL=self.__url, BRANCH=self.__branch, DIR=self.__dir)
+            return dedent("""\
+                export GIT_SSL_NO_VERIFY=true
+                if [ -d {DIR}/.git ] ; then
+                    cd {DIR}
+                    if [[ $(git rev-parse --abbrev-ref HEAD) == "{BRANCH}" ]] ; then
+                        git fetch -p origin
+                        git merge --ff-only refs/remotes/origin/{BRANCH}
+                    else
+                        echo "Warning: not updating {DIR} because branch was changed manually..." >&2
+                    fi
+                else
+                    if ! git clone -b {BRANCH} {URL} {DIR} ; then
+                        rm -rf {DIR}/.git {DIR}/*
+                        exit 1
+                    fi
+                    cd {DIR}
+                fi
+                {REMOTES}
+                """).format(URL=self.__url,
+                            BRANCH=self.__branch,
+                            DIR=self.__dir,
+                            REMOTES=remotes_script)
 
     def asDigestScript(self):
         """Return forward compatible stable string describing this git module.
@@ -170,9 +226,11 @@ fi
             ElementTree.SubElement(extensions,
                 "hudson.plugins.git.extensions.impl.RelativeTargetDirectory"),
             "relativeTargetDir").text = os.path.normpath(os.path.join(workPath, self.__dir))
-        # remove untracked files
+        # remove untracked files and stale branches
         ElementTree.SubElement(extensions,
             "hudson.plugins.git.extensions.impl.CleanCheckout")
+        ElementTree.SubElement(extensions,
+            "hudson.plugins.git.extensions.impl.PruneStaleBranch")
         shallow = options.get("scm.git.shallow")
         if shallow is not None:
             try:
@@ -188,6 +246,9 @@ fi
                 ElementTree.SubElement(co, "reference").text = ""
                 ElementTree.SubElement(co, "depth").text = str(shallow)
                 ElementTree.SubElement(co, "honorRefspec").text = "false"
+        if isTrue(options.get("scm.ignore-hooks", "0")):
+            ElementTree.SubElement(extensions,
+                "hudson.plugins.git.extensions.impl.IgnoreNotifyCommit")
 
         return scm
 
@@ -217,12 +278,12 @@ fi
     # Get GitSCM status. The purpose of this function is to return the status of the given directory
     #
     # return values:
-    #  - error: the scm is in a error state. Use this if git returned a error code.
-    #  - dirty: SCM is dirty. Could be: modified files, switched to another branch/tag/commit/repo, unpushed commits
-    #  - clean: same branch/tag/commit as specified in the recipe and no local changes.
-    #  - empty: directory is not existing
+    #  - error: The SCM is in a error state. Use this if git returned a error code.
+    #  - dirty: SCM is dirty. Could be: modified files, switched to another branch/tag/commit/repo, unpushed commits.
+    #  - clean: Same branch/tag/commit as specified in the recipe and no local changes.
+    #  - empty: Directory is not existing.
     #
-    # This function is called when build with --clean-checkou. 'error' and 'dirty' scm's are moved to attic,
+    # This function is called when build with --clean-checkout. 'error' and 'dirty' SCMs are moved to attic,
     # while empty and clean directories are not.
     def status(self, workspacePath, dir):
         scmdir = os.path.join(workspacePath, dir)
@@ -291,6 +352,61 @@ fi
     def getAuditSpec(self):
         return ("git", [self.__dir])
 
+    def hasLiveBuildId(self):
+        return True
+
+    def predictLiveBuildId(self):
+        if self.__commit:
+            return [ bytes.fromhex(self.__commit) ]
+
+        if self.__tag:
+            # Annotated tags are objects themselves. We need the commit object!
+            refs = ["refs/tags/" + self.__tag + '^{}', "refs/tags/" + self.__tag]
+        else:
+            refs = ["refs/heads/" + self.__branch]
+        cmdLine = ['git', 'ls-remote', self.__url] + refs
+        try:
+            output = subprocess.check_output(cmdLine, universal_newlines=True,
+                stderr=subprocess.STDOUT).strip()
+        except subprocess.CalledProcessError as e:
+            return [None]
+
+        # have we found anything at all?
+        if not output:
+            return [None]
+
+        # see if we got one of our intended refs
+        output = { ref.strip() : bytes.fromhex(commit.strip())
+            for commit, ref
+            in (line.split('\t') for line in output.split('\n')) }
+        for ref in refs:
+            if ref in output: return [output[ref]]
+
+        # uhh, should not happen...
+        return [None]
+
+    def calcLiveBuildId(self, workspacePath):
+        if self.__commit:
+            return [ bytes.fromhex(self.__commit) ]
+        else:
+            output = self.callGit(workspacePath, 'rev-parse', 'HEAD').strip()
+            return [ bytes.fromhex(output) ]
+
+    def getLiveBuildIdSpec(self, workspacePath):
+        if self.__commit:
+            return [ "=" + self.__commit ]
+        else:
+            return [ "g" + os.path.join(workspacePath, self.__dir) ]
+
+    @staticmethod
+    def processLiveBuildIdSpec(dir):
+        try:
+            return subprocess.check_output(["git", "rev-parse", "HEAD"],
+                cwd=dir, universal_newlines=True).strip()
+        except subprocess.CalledProcessError as e:
+            raise BuildError("Git audit failed: " + str(e))
+        except OSError as e:
+            raise BuildError("Error calling git: " + str(e))
 
 class GitAudit(ScmAudit):
 

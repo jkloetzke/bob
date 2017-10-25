@@ -28,6 +28,7 @@ from pipes import quote
 import argparse
 import datetime
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -43,6 +44,21 @@ import time
 def hashWorkspace(step):
     return hashDirectory(step.getWorkspacePath(),
         os.path.join(step.getWorkspacePath(), "..", "cache.bin"))
+
+def runHook(recipes, hook, args):
+    hookCmd = recipes.getBuildHook(hook)
+    ret = True
+    if hookCmd:
+        try:
+            hookCmd = os.path.expanduser(hookCmd)
+            ret = subprocess.call([hookCmd] + args) == 0
+        except OSError as e:
+            raise BuildError(hook + ": cannot run '" + hookCmd + ": " + str(e))
+
+    return ret
+
+class RestartBuildException(Exception):
+    pass
 
 class LocalBuilderStatistic:
     def __init__(self):
@@ -264,7 +280,7 @@ esac
         return fmt
 
     def __init__(self, recipes, verbose, force, skipDeps, buildOnly, preserveEnv,
-                 envWhiteList, bobRoot, cleanBuild, noLogFile):
+                 envWhiteList, bobRoot, cleanBuild, noLogFile, sharedFolder, installShared):
         self.__recipes = recipes
         self.__wasRun= {}
         self.__wasSkipped = {}
@@ -282,8 +298,12 @@ esac
         self.__bobRoot = bobRoot
         self.__cleanBuild = cleanBuild
         self.__cleanCheckout = False
-        self.__buildIds = {}
+        self.__srcBuildIds = {}
+        self.__buildDistBuildIds = {}
         self.__statistic = LocalBuilderStatistic()
+        self.__alwaysCheckout = []
+        self.__sharedFolder = sharedFolder
+        self.__installShared = installShared
 
     def setArchiveHandler(self, archive):
         self.__archive = archive
@@ -314,21 +334,35 @@ esac
     def setCleanCheckout(self, clean):
         self.__cleanCheckout = clean
 
+    def setAlwaysCheckout(self, alwaysCheckout):
+        self.__alwaysCheckout = [ re.compile(e) for e in alwaysCheckout ]
+
     def saveBuildState(self):
-        # Save as plain dict. Skipped steps are dropped because they were not
-        # really executed. Either they are simply skipped again or, if the
-        # user changes his mind, they will finally be executed.
-        state = { k:v for (k,v) in self.__wasRun.items()
-                      if not self.__wasSkipped.get(k, False) }
+        state = {}
+        # Save 'wasRun' as plain dict. Skipped steps are dropped because they
+        # were not really executed. Either they are simply skipped again or, if
+        # the user changes his mind, they will finally be executed.
+        state['wasRun'] = { path : (vid, isCheckoutStep)
+            for path, (vid, isCheckoutStep) in self.__wasRun.items()
+            if not self.__wasSkipped.get(path, False) }
+        # Save all predicted src build-ids. In case of a resume we won't ask
+        # the server again for a live-build-id. Regular src build-ids are
+        # cached by the usual 'wasRun' and 'resultHash' states.
+        state['predictedBuidId'] = { (path, vid) : bid
+            for (path, vid), (bid, predicted) in self.__srcBuildIds.items()
+            if predicted }
         BobState().setBuildState(state)
 
     def loadBuildState(self):
-        self.__wasRun = dict(BobState().getBuildState())
+        state = BobState().getBuildState()
+        self.__wasRun = dict(state['wasRun'])
+        self.__srcBuildIds = { (path, vid) : (bid, True)
+            for (path, vid), bid in state['predictedBuidId'].items() }
 
     def _wasAlreadyRun(self, step, skippedOk=False):
         path = step.getWorkspacePath()
         if path in self.__wasRun:
-            digest = self.__wasRun[path]
+            digest = self.__wasRun[path][0]
             # invalidate invalid cached entries
             if digest != step.getVariantId():
                 del self.__wasRun[path]
@@ -340,10 +374,16 @@ esac
         else:
             return False
 
-    def _setAlreadyRun(self, step, skipped=False):
+    def _setAlreadyRun(self, step, isCheckoutStep, skipped=False):
         path = step.getWorkspacePath()
-        self.__wasRun[path] = step.getVariantId()
+        self.__wasRun[path] = (step.getVariantId(), isCheckoutStep)
         self.__wasSkipped[path] = skipped
+
+    def _clearWasRun(self):
+        """Clear "was-run" info for build- and package-steps."""
+        self.__wasRun = { path : (vid, isCheckoutStep)
+            for path, (vid, isCheckoutStep) in self.__wasRun.items()
+            if isCheckoutStep }
 
     def _constructDir(self, step, label):
         created = False
@@ -393,9 +433,53 @@ esac
         audit.save(auditPath)
         return auditPath
 
+    def __linkDependencies(self, step):
+        """Create symlinks to the dependency workspaces"""
+
+        # this will only work on POSIX
+        if os.name != 'posix': return
+
+        # always re-create the deps directory
+        basePath = os.getcwd()
+        depsPath = os.path.join(basePath, step.getWorkspacePath(), "..", "deps")
+        removePath(depsPath)
+        os.makedirs(depsPath)
+
+        def linkTo(dest, linkName):
+            os.symlink(os.path.relpath(os.path.join(basePath, dest, ".."),
+                                       os.path.join(linkName, "..")),
+                       linkName)
+
+        # there can only be one sandbox
+        if step.getSandbox() is not None:
+            sandboxPath = os.path.join(depsPath, "sandbox")
+            linkTo(step.getSandbox().getStep().getWorkspacePath(), sandboxPath)
+
+        # link tools by name
+        tools = step.getTools()
+        if tools:
+            toolsPath = os.path.join(depsPath, "tools")
+            os.makedirs(toolsPath)
+            for (n,t) in tools.items():
+                linkTo(t.getStep().getWorkspacePath(), os.path.join(toolsPath, n))
+
+        # link dependencies by position and name
+        args = step.getArguments()
+        if args:
+            argsPath = os.path.join(depsPath, "args")
+            os.makedirs(argsPath)
+            i = 1
+            for a in args:
+                if a.isValid():
+                    linkTo(a.getWorkspacePath(),
+                           os.path.join(argsPath,
+                                        "{:02}-{}".format(i, a.getPackage().getName())))
+                i += 1
+
     def _runShell(self, step, scriptName):
         workspacePath = step.getWorkspacePath()
         if not os.path.isdir(workspacePath): os.makedirs(workspacePath)
+        self.__linkDependencies(step)
 
         # construct environment
         stepEnv = step.getEnv().copy()
@@ -546,7 +630,17 @@ esac
     def getStatistic(self):
         return self.__statistic
 
-    def cook(self, steps, parentPackage, checkoutOnly, depth=0):
+    def cook(self, step, checkoutOnly):
+        done = False
+        while not done:
+            try:
+                self._cook([step], step.getPackage(), checkoutOnly)
+                done = True
+            except RestartBuildException:
+                print(colorize("** Restart build due to wrongly predicted sources.", "33"))
+                self.__currentPackage = None
+
+    def _cook(self, steps, parentPackage, checkoutOnly, depth=0):
         currentPackage = self.__currentPackage
 
         # skip everything except the current package
@@ -600,7 +694,7 @@ esac
             self._info("   CHECKOUT  skipped (reuse {}) {}".format(prettySrcPath, overridesString))
         else:
             # depth first
-            self.cook(checkoutStep.getAllDepSteps(), checkoutStep.getPackage(),
+            self._cook(checkoutStep.getAllDepSteps(), checkoutStep.getPackage(),
                       False, depth+1)
 
             # get directory into shape
@@ -693,12 +787,27 @@ esac
             checkoutHash = hashWorkspace(checkoutStep)
             BobState().setResultHash(prettySrcPath, checkoutHash)
 
-            self._setAlreadyRun(checkoutStep)
+            self._setAlreadyRun(checkoutStep, True)
 
             # Generate audit trail. Has to be done _after_ setResultHash()
             # because the result is needed to calculate the buildId.
             if (checkoutHash != oldCheckoutHash) or checkoutExecuted:
                 self._generateAudit(checkoutStep, depth, checkoutHash, checkoutExecuted)
+
+            # upload live build-id cache in case of fresh checkout
+            if created and self.__archive.canUploadLocal() and checkoutStep.hasLiveBuildId():
+                liveBId = checkoutStep.calcLiveBuildId()
+                if liveBId is not None:
+                    self.__archive.uploadLocalLiveBuildId(liveBId, checkoutHash, self.__verbose)
+
+            # Predicted build-id and real one after checkout do not need to
+            # match necessarily. Handle it as some build results might be
+            # inconsistent to the sources now.
+            buildId, predicted = self.__srcBuildIds.get((prettySrcPath, checkoutDigest),
+                (checkoutHash, False))
+            if buildId != checkoutHash:
+                assert predicted, "Non-predicted incorrect Build-Id found!"
+                self.__handleChangedBuildId(checkoutStep, checkoutHash)
 
     def _cookBuildStep(self, buildStep, checkoutOnly, depth):
         # Include actual directories of dependencies in buildDigest.
@@ -713,8 +822,8 @@ esac
             self._info("   BUILD     skipped (reuse {})".format(prettyBuildPath))
         else:
             # depth first
-            self.cook(buildStep.getAllDepSteps(), buildStep.getPackage(),
-                      checkoutOnly, depth+1)
+            self._cook(buildStep.getAllDepSteps(), buildStep.getPackage(),
+                       checkoutOnly, depth+1)
 
             # get directory into shape
             (prettyBuildPath, created) = self._constructDir(buildStep, "build")
@@ -756,7 +865,7 @@ esac
                 self._generateAudit(buildStep, depth, buildHash)
                 BobState().setResultHash(prettyBuildPath, buildHash)
                 BobState().setInputHashes(prettyBuildPath, buildInputHashes)
-            self._setAlreadyRun(buildStep, checkoutOnly)
+            self._setAlreadyRun(buildStep, False, checkoutOnly)
 
     def _cookPackageStep(self, packageStep, checkoutOnly, depth):
         packageDigest = packageStep.getVariantId()
@@ -782,9 +891,16 @@ esac
             # Can we theoretically download the result? Exclude packages that
             # provide host tools when not building in a sandbox. Try to
             # determine a build-id for all other artifacts.
+            #
+            # Create build-id for shared packages, but don't download them
             if packageStep.doesProvideTools() and (packageStep.getSandbox() is None):
-                packageBuildId = None
+                if packageStep.isShared() and self.__sharedFolder:
+                    canDownload = False
+                    packageBuildId = self._getBuildId(packageStep, depth)
+                else:
+                    packageBuildId = None
             else:
+                canDownload = True
                 packageBuildId = self._getBuildId(packageStep, depth)
 
             # If we download the package in the last run the Build-Id is stored
@@ -795,14 +911,14 @@ esac
             if (isinstance(oldInputBuildId, list) and (len(oldInputBuildId) >= 1)):
                 oldInputHashes = oldInputBuildId[1:]
                 oldInputBuildId = oldInputBuildId[0]
-                oldWasDownloaded = False
+                oldWasDownloadedOrShared = False
             elif isinstance(oldInputBuildId, bytes):
-                oldWasDownloaded = True
+                oldWasDownloadedOrShared = True
                 oldInputHashes = None
             else:
                 # created by old Bob version or new workspace
                 oldInputHashes = oldInputBuildId
-                oldWasDownloaded = False
+                oldWasDownloadedOrShared = False
 
             # If possible try to download the package. If we downloaded the
             # package in the last run we have to make sure that the Build-Id is
@@ -817,10 +933,12 @@ esac
             #   build-id changed -> prune and try download, fall back to build
             workspaceChanged = False
             wasDownloaded = False
-            if ( (not checkoutOnly) and packageBuildId and (depth >= self.__downloadDepth) ):
+            wasShared = False
+            if ( (not checkoutOnly) and packageBuildId and (depth >= self.__downloadDepth) ) and canDownload:
                 # prune directory if we previously downloaded/built something different
-                if (oldInputBuildId is not None) and (oldInputBuildId != packageBuildId):
-                    print(colorize("   PRUNE     {} (build-id changed)".format(prettyPackagePath), "33"))
+                if ((oldInputBuildId is not None) and (oldInputBuildId != packageBuildId)) or self.__force:
+                    print(colorize("   PRUNE     {} ({})".format(prettyPackagePath,
+                            "build forced" if self.__force else "build-id changed"), "33"))
                     emptyDirectory(prettyPackagePath)
                     BobState().delInputHashes(prettyPackagePath)
                     BobState().delResultHash(prettyPackagePath)
@@ -840,18 +958,44 @@ esac
                         wasDownloaded = True
                     elif self.__forcedDownload:
                         raise BuildError("Downloading artifact failed")
-                elif oldWasDownloaded:
-                    self._info("   PACKAGE   skipped (deterministic output in {})".format(prettyPackagePath))
+                elif oldWasDownloadedOrShared:
+                    self._info("   PACKAGE   skipped (already downloaded in {})".format(prettyPackagePath))
                     wasDownloaded = True
+
+            if packageStep.isShared() and self.__sharedFolder and not wasDownloaded:
+                if BobState().getResultHash(prettyPackagePath) is None:
+                    sharedpackagepath = os.path.join(self.__sharedFolder, asHexStr(packageBuildId))
+                    # link into dist if shared package available
+                    if self._checkSharedPackage(packageStep, asHexStr(packageBuildId)):
+                        print(colorize("     Link from shared location {}".format(sharedpackagepath), "32"))
+                        dirlist = os.listdir(sharedpackagepath)
+                        cwd = os.getcwd()
+                        os.chdir(prettyPackagePath)
+                        for item in dirlist:
+                            if item == '.installed':
+                                continue
+                            itempath = os.path.join(sharedpackagepath, item)
+                            if item in ['env', 'audit.json.gz']:
+                                os.symlink(itempath, os.path.join(os.getcwd(), '..', item))
+                            else:
+                                os.symlink(itempath, item, os.path.isdir(itempath))
+                        os.chdir(cwd)
+                        wasShared = True
+                        workspaceChanged = True
+                        packageHash = hashWorkspace(packageStep)
+                elif oldWasDownloadedOrShared:
+                    self._info("   PACKAGE   skipped (deterministic output in {})".format(prettyPackagePath))
+                    wasShared = True
+
 
             # Run package step if we have not yet downloaded the package or if
             # downloads are not possible anymore. Even if the package was
             # previously downloaded the oldInputHashes will be None to trigger
             # an actual build.
-            if not wasDownloaded:
+            if not wasDownloaded and not wasShared:
                 # depth first
-                self.cook(packageStep.getAllDepSteps(), packageStep.getPackage(),
-                          checkoutOnly, depth+1)
+                self._cook(packageStep.getAllDepSteps(), packageStep.getPackage(),
+                           checkoutOnly, depth+1)
 
                 packageInputHashes = [ BobState().getResultHash(i.getWorkspacePath())
                     for i in packageStep.getArguments() if i.isValid() ]
@@ -868,39 +1012,186 @@ esac
                     self._runShell(packageStep, "package")
                     packageHash = hashWorkspace(packageStep)
                     audit = self._generateAudit(packageStep, depth, packageHash)
+                    # copy to shared location if possible
+                    if self.__installShared and packageStep.isShared():
+                        sharedpackagepath = os.path.join(self.__sharedFolder, asHexStr(packageBuildId))
+                        print(colorize("     Install in shared location {}".format(sharedpackagepath), "32"))
+                        if os.path.exists(sharedpackagepath):
+                            shutil.rmtree(sharedpackagepath)
+                        # copy all files from workspace - keep symlinks
+                        shutil.copytree(prettyPackagePath, sharedpackagepath, symlinks=True)
+                        # copy env file - important for audit
+                        shutil.copy2(os.path.join(prettyPackagePath, '..', 'env'), sharedpackagepath)
+                        shutil.copy2(os.path.join(prettyPackagePath, '..', 'audit.json.gz'), sharedpackagepath)
+                        open(os.path.join(sharedpackagepath, '.installed'), 'a').close()
                     workspaceChanged = True
                     self.__statistic.packagesBuilt += 1
                     if packageBuildId and self.__archive.canUploadLocal():
-                        self.__archive.uploadPackage(packageBuildId, audit, prettyPackagePath, self.__verbose)
+                        if not (packageStep.doesProvideTools() and (packageStep.getSandbox() is None)):
+                            self.__archive.uploadPackage(packageBuildId, audit, prettyPackagePath, self.__verbose)
+
 
             # Rehash directory if content was changed
             if workspaceChanged:
                 BobState().setResultHash(prettyPackagePath, packageHash)
-                if wasDownloaded:
+                if wasDownloaded or wasShared:
                     BobState().setInputHashes(prettyPackagePath, packageBuildId)
                 else:
                     BobState().setInputHashes(prettyPackagePath, [packageBuildId] + packageInputHashes)
-            self._setAlreadyRun(packageStep, checkoutOnly)
+            self._setAlreadyRun(packageStep, False, checkoutOnly)
+
+    def __queryLiveBuildId(self, step):
+        """Predict live build-id of checkout step.
+
+        Query the SCMs for their live-buildid and cache the result. Normally
+        the current result is retuned unless we're in build-only mode. Then the
+        cached result is used. Only if there is no cached entry the query is
+        performed.
+        """
+
+        key = b'\x00' + step._getSandboxVariantId()
+        if self.__buildOnly:
+            liveBId = BobState().getBuildId(key)
+            if liveBId is not None: return liveBId
+
+        if self.__verbose > 0:
+            print(colorize("   QUERY-SRC {} .. ".format(step.getPackage().getName()), "32"), end="")
+        liveBId = None
+        try:
+            liveBId = step.predictLiveBuildId()
+        finally:
+            if self.__verbose > 0:
+                if liveBId is None:
+                    print(colorize("unknown", "33"))
+                else:
+                    print(colorize("ok", "32"))
+
+        if liveBId is not None:
+            BobState().setBuildId(key, liveBId)
+        return liveBId
+
+    def __invalidateLiveBuildId(self, step):
+        """Invalidate last live build-id of a step."""
+
+        key = b'\x00' + step._getSandboxVariantId()
+        liveBId = BobState().getBuildId(key)
+        if liveBId is not None:
+            BobState().delBuildId(key)
+
+    def __translateLiveBuildId(self, liveBId):
+        """Translate live build-id into real build-id.
+
+        We maintain a local cache of previous translations. In case of a cache
+        miss the archive is interrogated. A valid result is cached.
+        """
+        key = b'\x01' + liveBId
+        bid = BobState().getBuildId(key)
+        if bid is not None:
+            return bid
+
+        bid = self.__archive.downloadLocalLiveBuildId(liveBId, self.__verbose)
+        if bid is not None:
+            BobState().setBuildId(key, bid)
+
+        return bid
+
+    def __getCheckoutStepBuildId(self, step, depth):
+        ret = None
+        v = (self.__verbose >= -1) and (self.__verbose < 1)
+
+        # Try to use live build-ids for checkout steps. Do not use them if
+        # there is already a workspace or if the package matches one of the
+        # 'always-checkout' patterns. Fall back to a regular checkout if any
+        # condition is not met.
+        name = step.getPackage().getName()
+        if not os.path.exists(step.getWorkspacePath()) and \
+           not any(pat.match(name) for pat in self.__alwaysCheckout) and \
+           step.hasLiveBuildId() and self.__archive.canDownloadLocal():
+            if v:
+                print(colorize("   QUERY     {} .. ".format(step.getPackage().getName()), "32"), end="")
+            try:
+                liveBId = self.__queryLiveBuildId(step)
+                if liveBId:
+                    ret = self.__translateLiveBuildId(liveBId)
+            finally:
+                if v:
+                    if ret is None:
+                        print(colorize("unknown", "33"))
+                    else:
+                        print(colorize("ok", "32"))
+
+        # do the checkout if we still don't have a build-id
+        if ret is None:
+            # do checkout
+            self._cook([step], step.getPackage(), depth)
+            # return directory hash
+            ret = BobState().getResultHash(step.getWorkspacePath())
+            predicted = False
+        else:
+            predicted = True
+
+        return ret, predicted
+
+    def _checkSharedPackage(self, step, packageBuildId):
+         sharedPackagePath = os.path.join(self.__sharedFolder, packageBuildId)
+         if os.path.isdir(sharedPackagePath):
+             if os.path.exists(os.path.join(sharedPackagePath, '.installed')):
+                 return True
+         return False
 
     def _getBuildId(self, step, depth):
         """Calculate build-id and cache result.
 
         The cache uses the workspace path as index because there might be
-        multiple directories with the same variant-id.
+        multiple directories with the same variant-id. As the src build-ids can
+        be cached for a long time the variant-id is used as index too to
+        prevent possible false hits if the recipes change between runs.
+
+        Checkout steps are cached separately from build and package steps.
+        Build-ids of checkout steps may be predicted through live-build-ids. If
+        we the prediction was wrong the build and package step build-ids are
+        invalidated because they could be derived from the wrong checkout
+        build-id.
         """
         path = step.getWorkspacePath()
-        ret = self.__buildIds.get(path)
-        if ret is None:
-            if step.isCheckoutStep():
-                # do checkout
-                self.cook([step], step.getPackage(), depth)
-                # return directory hash
-                ret = BobState().getResultHash(step.getWorkspacePath())
-            else:
+        if step.isCheckoutStep():
+            key = (path, step.getVariantId())
+            ret, predicted = self.__srcBuildIds.get(key, (None, False))
+            if ret is None:
+                tmp = self.__getCheckoutStepBuildId(step, depth)
+                self.__srcBuildIds[key] = tmp
+                ret = tmp[0]
+        else:
+            ret = self.__buildDistBuildIds.get(path)
+            if ret is None:
                 ret = step.getDigest(lambda s: self._getBuildId(s, depth+1), True)
-            self.__buildIds[path] = ret
+                self.__buildDistBuildIds[path] = ret
 
         return ret
+
+    def __handleChangedBuildId(self, step, checkoutHash):
+        """Handle different build-id of src step after checkout.
+
+        Through live-build-ids it is possible that an initially queried
+        build-id does not match the real build-id after the sources have been
+        checked out. As we might have already downloaded artifacts based on
+        the now invalidated build-id we have to restart the build and check all
+        build-ids, build- and package-steps again.
+        """
+        key = (step.getWorkspacePath(), step.getVariantId())
+
+        # Invalidate wrong live-build-id
+        self.__invalidateLiveBuildId(step)
+
+        # Invalidate (possibly) derived build-ids
+        self.__srcBuildIds[key] = (checkoutHash, False)
+        self.__buildDistBuildIds = {}
+
+        # Forget all executed build- and package-steps
+        self._clearWasRun()
+
+        # start from scratch
+        raise RestartBuildException()
 
 
 def touch(packages):
@@ -943,6 +1234,8 @@ def commonBuildDevelop(parser, argv, bobRoot, develop):
         help="Do clean builds (clear build directory)")
     group.add_argument('--incremental', action='store_false', dest='clean',
         help="Reuse build directory for incremental builds")
+    parser.add_argument('--always-checkout', default=[], action='append', metavar="RE",
+        help="Regex pattern of packages that should always be checked out")
     parser.add_argument('--resume', default=False, action='store_true',
         help="Resume build where it was previously interrupted")
     parser.add_argument('-q', '--quiet', default=0, action='count',
@@ -964,6 +1257,10 @@ def commonBuildDevelop(parser, argv, bobRoot, develop):
     parser.add_argument('--download', metavar="MODE", default=None,
         help="Download from binary archive (yes, no, deps, forced, forced-deps)",
         choices=['yes', 'no', 'deps', 'forced', 'forced-deps'])
+    parser.add_argument('-s', '--shared', default=None,
+        help="Set destination folder for shared packages")
+    parser.add_argument('-i', '--installshared', action='store_true', default=False,
+        help="Shared packages can be installed")
     group = parser.add_mutually_exclusive_group()
     group.add_argument('--sandbox', action='store_true', default=None,
         help="Enable sandboxing")
@@ -1033,12 +1330,13 @@ def commonBuildDevelop(parser, argv, bobRoot, develop):
     builder = LocalBuilder(recipes, cfg.get('verbosity', 0) + args.verbose - args.quiet, args.force,
                            args.no_deps, True if args.build_mode == 'build-only' else False,
                            args.preserve_env, envWhiteList, bobRoot, args.clean,
-                           args.no_logfiles)
+                           args.no_logfiles, args.shared, args.installshared)
 
     builder.setArchiveHandler(getArchiver(recipes))
     builder.setUploadMode(args.upload)
     builder.setDownloadMode(args.download)
     builder.setCleanCheckout(args.clean_checkout)
+    builder.setAlwaysCheckout(args.always_checkout + cfg.get('always_checkout', []))
     if args.resume: builder.loadBuildState()
 
     backlog = []
@@ -1051,14 +1349,22 @@ def commonBuildDevelop(parser, argv, bobRoot, develop):
             build_provided = (args.destination and args.build_provided == None) or args.build_provided
             if build_provided: backlog.extend(packageStep._getProvidedDeps())
 
+    success = runHook(recipes, 'preBuildHook',
+        ["/".join(p.getPackage().getStack()) for p in backlog])
+    if not success:
+        raise BuildError("preBuildHook failed!",
+            help="A preBuildHook is set but it returned with a non-zero status.")
+    success = False
     try:
         for p in backlog:
-            builder.cook([p], p.getPackage(), True if args.build_mode == 'checkout-only' else False)
+            builder.cook(p, True if args.build_mode == 'checkout-only' else False)
             resultPath = p.getWorkspacePath()
             if resultPath not in results:
                 results.append(resultPath)
+            success = True
     finally:
         builder.saveBuildState()
+        runHook(recipes, 'postBuildHook', ["success" if success else "fail"] + results)
 
     # tell the user
     if results:

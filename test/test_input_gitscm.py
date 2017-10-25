@@ -14,9 +14,15 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+from pipes import quote
 from unittest import TestCase
+import os
+import subprocess
+import tempfile
 
 from bob.input import GitScm
+from bob.errors import ParseError
+from bob.utils import asHexStr
 
 def createGitScm(spec = {}):
     s = { 'scm' : "git", 'url' : "MyURL", 'recipe' : "foo.yaml#0" }
@@ -125,6 +131,9 @@ class TestGitScm(TestCase):
         s = createGitScm({'commit' : "0123456789abcdef0123456789abcdef01234567"})
         self.assertIsInstance(s.asScript(), str)
 
+        s = createGitScm({'remote-test' : "test/url.git"})
+        self.assertRegexpMatches(s.asScript(), ".*test.*test/url.git.*")
+
     def testDigestScripts(self):
         """Test digest script stable representation"""
         s = createGitScm()
@@ -179,3 +188,229 @@ class TestGitScm(TestCase):
         self.assertEqual(s2.merge(s1), False)
         self.assertEqual(s2.hasJenkinsPlugin(), True)
         self.assertEqual(s2.isDeterministic(), True)
+
+    def testRemotesSetAndGet(self):
+        """Test setting and getting remotes as they are stored in a different format internally"""
+        s1 = createGitScm({'remote-test_user' : "test/url", 'remote-other_user' : "other/url"})
+        self.assertEqual(s1.getProperties()[0]['remote-test_user'], "test/url")
+        self.assertEqual(s1.getProperties()[0]['remote-other_user'], "other/url")
+
+    def testRemotesSetOrigin(self):
+        """A remote calle origin should result in an error, because this is the default remote name"""
+        self.assertRaises(ParseError, createGitScm, {'remote-origin' : "test/url.git"})
+
+
+class RealGitRepositoryTestCase(TestCase):
+    """
+    Helper class that provides a "remote" git repository and some facilities to
+    acutally run the checkout script.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.__repodir = tempfile.TemporaryDirectory()
+        cls.repodir = cls.__repodir.name
+
+        subprocess.check_call('git init --bare .', shell=True, cwd=cls.repodir)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cmds = "\n".join([
+                'git init .',
+                'git config user.email "bob@bob.bob"',
+                'git config user.name test',
+                'echo "hello world" > test.txt',
+                'git add test.txt',
+                'git commit -m "first commit"',
+                'git tag -a -m "First Tag" annotated',
+                'git checkout -b foobar',
+                'echo "changed" > test.txt',
+                'git commit -a -m "second commit"',
+                'git tag lightweight',
+                'git remote add origin ' + quote(cls.repodir),
+                'git push origin master foobar annotated lightweight',
+            ])
+            subprocess.check_call(cmds, shell=True, cwd=tmp)
+
+            def revParse(obj):
+                return bytes.fromhex(subprocess.check_output('git rev-parse ' + obj,
+                    universal_newlines=True, shell=True, cwd=tmp).strip())
+
+            cls.commit_master = revParse('master')
+            cls.commit_foobar = revParse('foobar')
+            cls.commit_annotated = revParse('annotated^{}')
+            cls.commit_lightweight = revParse('lightweight')
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.__repodir.cleanup()
+
+    def createGitScm(self, spec = {}):
+        s = {
+            'scm' : "git",
+            'url' : self.repodir,
+            'recipe' : "foo.yaml#0",
+        }
+        s.update(spec)
+        return GitScm(s)
+
+
+class TestGitRemotes(RealGitRepositoryTestCase):
+
+    def callAndGetRemotes(self, workspace, scm):
+        subprocess.check_call(['/bin/bash', '-c', scm.asScript()],
+            universal_newlines=True, stderr=subprocess.STDOUT, cwd=workspace)
+        remotes = subprocess.check_output(["git", "remote", "-v"],
+            cwd=os.path.join(workspace, scm.getProperties()[0]['dir']),
+            universal_newlines=True).split("\n")
+        remotes = (r[:-8].split("\t") for r in remotes if r.endswith("(fetch)"))
+        return { remote:url for (remote,url) in remotes }
+
+    def testPlainCheckout(self):
+        """Do regular checkout and verify origin"""
+        s = self.createGitScm()
+        with tempfile.TemporaryDirectory() as workspace:
+            remotes = self.callAndGetRemotes(workspace, s)
+            self.assertEqual(remotes, { "origin" : self.repodir })
+
+    def testAdditionalRemoteCheckout(self):
+        """Initial checkout with two more remotes"""
+        s = self.createGitScm({
+            'remote-foo' : '/does/not/exist',
+            'remote-bar' : 'http://bar.test/baz.git',
+        })
+        with tempfile.TemporaryDirectory() as workspace:
+            remotes = self.callAndGetRemotes(workspace, s)
+            self.assertEqual(remotes, {
+                "origin" : self.repodir,
+                'foo' : '/does/not/exist',
+                'bar' : 'http://bar.test/baz.git',
+            })
+
+    def testSubDirCheckout(self):
+        """Regression test for sub-directory checkouts"""
+        s = self.createGitScm({'dir' : 'sub/dir'})
+        with tempfile.TemporaryDirectory() as workspace:
+            remotes = self.callAndGetRemotes(workspace, s)
+            self.assertEqual(remotes, { "origin" : self.repodir })
+
+        s = self.createGitScm({'dir' : 'sub/dir', 'tag' : 'annotated'})
+        with tempfile.TemporaryDirectory() as workspace:
+            remotes = self.callAndGetRemotes(workspace, s)
+            self.assertEqual(remotes, { "origin" : self.repodir })
+
+    def testChangeRemote(self):
+        """Test that changed remotes in recipe are updated in the working copy"""
+        s1 = self.createGitScm({
+            'remote-bar' : 'http://bar.test/baz.git',
+        })
+        s2 = self.createGitScm({
+            'remote-bar' : 'http://bar.test/foo.git',
+        })
+        with tempfile.TemporaryDirectory() as workspace:
+            remotes = self.callAndGetRemotes(workspace, s1)
+            self.assertEqual(remotes, {
+                "origin" : self.repodir,
+                'bar' : 'http://bar.test/baz.git',
+            })
+            remotes = self.callAndGetRemotes(workspace, s2)
+            self.assertEqual(remotes, {
+                "origin" : self.repodir,
+                'bar' : 'http://bar.test/foo.git',
+            })
+
+
+class TestLiveBuildId(RealGitRepositoryTestCase):
+    """Test live-build-id support of git scm"""
+
+    def callCalcLiveBuildId(self, scm):
+        with tempfile.TemporaryDirectory() as workspace:
+            subprocess.check_call(['/bin/bash', '-c', scm.asScript()],
+                universal_newlines=True, stderr=subprocess.STDOUT, cwd=workspace)
+            return scm.calcLiveBuildId(workspace)
+
+    def processHashEngine(self, scm, expected):
+        with tempfile.TemporaryDirectory() as workspace:
+            subprocess.check_call(['/bin/bash', '-c', scm.asScript()],
+                universal_newlines=True, stderr=subprocess.STDOUT, cwd=workspace)
+            [spec] = scm.getLiveBuildIdSpec(workspace)
+            if spec.startswith('='):
+                self.assertEqual(bytes.fromhex(spec[1:]), expected)
+            else:
+                self.assertTrue(spec.startswith('g'))
+                self.assertEqual(bytes.fromhex(GitScm.processLiveBuildIdSpec(spec[1:])),
+                    expected)
+
+    def testHasLiveBuildId(self):
+        """GitScm's always support live-build-ids"""
+        s = self.createGitScm()
+        self.assertTrue(s.hasLiveBuildId())
+
+    def testPredictBranch(self):
+        """See if we can predict remote branches correctly"""
+        s = self.createGitScm()
+        self.assertEqual(s.predictLiveBuildId(), [self.commit_master])
+
+        s = self.createGitScm({ 'branch' : 'foobar' })
+        self.assertEqual(s.predictLiveBuildId(), [self.commit_foobar])
+
+    def testPredictLightweightTags(self):
+        """Lightweight tags are just like branches"""
+        s = self.createGitScm({ 'tag' : 'lightweight' })
+        self.assertEqual(s.predictLiveBuildId(), [self.commit_lightweight])
+
+    def testPredictAnnotatedTags(self):
+        """Predict commit object of annotated tags.
+
+        Annotated tags are separate git objects that point to a commit object.
+        We have to predict the commit object, not the tag object."""
+        s = self.createGitScm({ 'tag' : 'annotated' })
+        self.assertEqual(s.predictLiveBuildId(), [self.commit_annotated])
+
+    def testPredictCommit(self):
+        """Predictions of explicit commit-ids are easy."""
+        s = self.createGitScm({ 'commit' : asHexStr(self.commit_foobar) })
+        self.assertEqual(s.predictLiveBuildId(), [self.commit_foobar])
+
+    def testPredictBroken(self):
+        """Predictions of broken URLs must not fail"""
+        s = self.createGitScm({ 'url' : '/does/not/exist' })
+        self.assertEqual(s.predictLiveBuildId(), [None])
+
+    def testPredictDeleted(self):
+        """Predicting deleted branches/tags must not fail"""
+        s = self.createGitScm({ 'branch' : 'nx' })
+        self.assertEqual(s.predictLiveBuildId(), [None])
+        s = self.createGitScm({ 'tag' : 'nx' })
+        self.assertEqual(s.predictLiveBuildId(), [None])
+
+    def testCalcBranch(self):
+        """Clone branch and calculate live-build-id"""
+        s = self.createGitScm()
+        self.assertEqual(self.callCalcLiveBuildId(s), [self.commit_master])
+        s = self.createGitScm({ 'branch' : 'foobar' })
+        self.assertEqual(self.callCalcLiveBuildId(s), [self.commit_foobar])
+
+    def testCalcTags(self):
+        """Clone tag and calculate live-build-id"""
+        s = self.createGitScm({ 'tag' : 'annotated' })
+        self.assertEqual(self.callCalcLiveBuildId(s), [self.commit_annotated])
+        s = self.createGitScm({ 'tag' : 'lightweight' })
+        self.assertEqual(self.callCalcLiveBuildId(s), [self.commit_lightweight])
+
+    def testCalcCommit(self):
+        """Clone commit and calculate live-build-id"""
+        s = self.createGitScm({ 'commit' : asHexStr(self.commit_foobar) })
+        self.assertEqual(self.callCalcLiveBuildId(s), [self.commit_foobar])
+
+    def testHashEngine(self):
+        """Calculate live-build-id via bob-hash-engine spec"""
+        s = self.createGitScm()
+        self.processHashEngine(s, self.commit_master)
+        s = self.createGitScm({ 'branch' : 'foobar' })
+        self.processHashEngine(s, self.commit_foobar)
+        s = self.createGitScm({ 'tag' : 'annotated' })
+        self.processHashEngine(s, self.commit_annotated)
+        s = self.createGitScm({ 'tag' : 'lightweight' })
+        self.processHashEngine(s, self.commit_lightweight)
+        s = self.createGitScm({ 'commit' : asHexStr(self.commit_foobar) })
+        self.processHashEngine(s, self.commit_foobar)

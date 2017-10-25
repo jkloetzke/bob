@@ -16,6 +16,7 @@
 
 from .errors import ParseError
 import copy
+import dbm
 import errno
 import os
 import pickle
@@ -28,8 +29,10 @@ class _BobState():
     # Version history:
     #  2 -> 3: byNameDirs: values are tuples (directory, isSourceDir)
     #  3 -> 4: jenkins job names are lower case
+    #  4 -> 5: build state stores step kind (checkout-step vs. others)
+    #  5 -> 6: build state stores predicted live-build-ids too
     MIN_VERSION = 2
-    CUR_VERSION = 4
+    CUR_VERSION = 6
 
     instance = None
     def __init__(self):
@@ -43,6 +46,7 @@ class _BobState():
         self.__dirStates = {}
         self.__buildState = {}
         self.__lock = None
+        self.__buildIdCache = None
 
         # lock state
         lockFile = ".bob-state.lock"
@@ -61,37 +65,53 @@ class _BobState():
             os.close(fd)
 
         # load state if it exists
-        if os.path.exists(self.__path):
-            try:
-                with open(self.__path, 'rb') as f:
-                    state = pickle.load(f)
-            except OSError as e:
-                raise ParseError("Error loading workspace state: " + str(e))
-            except pickle.PickleError as e:
-                raise ParseError("Error decoding workspace state: " + str(e))
+        try:
+            if os.path.exists(self.__path):
+                try:
+                    with open(self.__path, 'rb') as f:
+                        state = pickle.load(f)
+                except OSError as e:
+                    raise ParseError("Error loading workspace state: " + str(e))
+                except pickle.PickleError as e:
+                    raise ParseError("Error decoding workspace state: " + str(e))
 
-            if state["version"] < _BobState.MIN_VERSION:
-                raise ParseError("This version of bob cannot read the build tree anymore. Sorry. :-(")
-            if state["version"] > _BobState.CUR_VERSION:
-                raise ParseError("This version of bob is too old for the build tree.")
-            self.__byNameDirs = state["byNameDirs"]
-            self.__results = state["results"]
-            self.__inputs = state["inputs"]
-            self.__jenkins = state.get("jenkins", {})
-            self.__dirStates = state.get("dirStates", {})
-            self.__buildState = state.get("buildState", {})
+                if state["version"] < _BobState.MIN_VERSION:
+                    raise ParseError("This version of Bob cannot read the workspace anymore. Sorry. :-(",
+                                     help="This workspace was created by an older version of Bob that is no longer supported.")
+                if state["version"] > _BobState.CUR_VERSION:
+                    raise ParseError("This version of Bob is too old for the workspace.",
+                                     help="A more recent version of Bob was previously used in this workspace. You have to use that version instead.")
+                self.__byNameDirs = state["byNameDirs"]
+                self.__results = state["results"]
+                self.__inputs = state["inputs"]
+                self.__jenkins = state.get("jenkins", {})
+                self.__dirStates = state.get("dirStates", {})
+                self.__buildState = state.get("buildState", {})
 
-            # version upgrades
-            if state["version"] == 2:
-                self.__byNameDirs = {
-                    digest : ((dir, False) if isinstance(dir, str) else dir)
-                    for (digest, dir) in self.__byNameDirs.items()
-                }
+                # version upgrades
+                if state["version"] == 2:
+                    self.__byNameDirs = {
+                        digest : ((dir, False) if isinstance(dir, str) else dir)
+                        for (digest, dir) in self.__byNameDirs.items()
+                    }
 
-            if state["version"] <= 3:
-                for j in self.__jenkins.values():
-                    jobs = j["jobs"]
-                    j["jobs"] = { k.lower() : v for (k,v) in jobs.items() }
+                if state["version"] <= 3:
+                    for j in self.__jenkins.values():
+                        jobs = j["jobs"]
+                        j["jobs"] = { k.lower() : v for (k,v) in jobs.items() }
+
+                if state["version"] <= 4:
+                    self.__buildState = { path : (vid, False)
+                        for path, vid in self.__buildState.items() }
+
+                if state["version"] <= 5:
+                    self.__buildState = {
+                        'wasRun' : self.__buildState,
+                        'predictedBuidId' : {}
+                    }
+        except:
+            self.finalize()
+            raise
 
     def __save(self):
         if self.__asynchronous == 0:
@@ -117,8 +137,17 @@ class _BobState():
         else:
             self.__dirty = True
 
+    def __getBIdCache(self):
+        if self.__buildIdCache is None:
+            self.__buildIdCache = dbm.open(".bob-buildids.dbm", 'c')
+            #self.__buildIdCache = {}
+        return self.__buildIdCache
+
     def finalize(self):
         assert (self.__asynchronous == 0) and not self.__dirty
+        if self.__buildIdCache is not None:
+            self.__buildIdCache.close()
+            self.__buildIdCache = None
         if self.__lock:
             try:
                 os.unlink(self.__lock)
@@ -254,6 +283,15 @@ class _BobState():
 
     def getBuildState(self):
         return copy.deepcopy(self.__buildState)
+
+    def getBuildId(self, key):
+        return self.__getBIdCache().get(key, None)
+
+    def setBuildId(self, key, val):
+        self.__getBIdCache()[key] = val
+
+    def delBuildId(self, key):
+        del self.__getBIdCache()[key]
 
 def BobState():
     if _BobState.instance is None:

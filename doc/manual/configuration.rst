@@ -2,7 +2,7 @@ Configuration
 =============
 
 When building packages Bob executes the instructions defined by the recipes.
-All recipes are located relative to the working directory in the ``recipes``
+All recipes are located relative to the project root directory in the ``recipes``
 subdirectory. Recipes are YAML files with a defined structure. The name of the
 recipe and the resulting package(s) is derived from the file name by removing
 the trailing '.yaml'. To aid further organization of the recipes they may be
@@ -536,6 +536,7 @@ git `Git`_ project               | ``url``: URL of remote repository
                                  | ``tag``: Checkout this tag (optional, overrides branch attribute)
                                  | ``commit``: SHA1 commit Id to check out (optional, overrides branch or tag attribute)
                                  | ``rev``: Canonical git-rev-parse revision specification (optional, see below)
+                                 | ``remote-*``: additional remote repositories (optional, see below)
 svn `Svn`_ repository            | ``url``: URL of SVN module
                                  | ``revision``: Optional revision number (optional)
 cvs CVS repository               | ``cvsroot``: repository location ("``:ext:...``", path name, etc.)
@@ -573,6 +574,12 @@ described in git-rev-parse(1) the following formats are currently supported:
   The symbolic name of a tag.
 * refs/heads/<branchname>, e.g. refs/heads/master.
   The name of a branch.
+
+The ``remote-*`` property allows adding extra remotes whereas the part after
+``remote-`` corresponds to the remote name and the value given corresponds to
+the remote URL. For example ``remote-my_name`` set to ``some/url.git`` will
+result in an additional remote named ``my_name`` and the URL set to
+``some/url.git``.
 
 The Svn SCM, like git, requires the ``url`` attribute too. If you specify a
 numeric ``revision`` Bob considers the SCM as deterministic.
@@ -1089,7 +1096,7 @@ specified without the .yaml extension::
     from where includes are resolved is different. Normally files are included
     relative to the currently processed file unless the
     :ref:`policies-relativeIncludes` policy is disabled. In this case files
-    included by ``default.yaml`` and by the command line use the recipes
+    included by ``default.yaml`` and by the command line use the project root
     directory as base directory.
 
 .. _configuration-config-environment:
@@ -1309,4 +1316,58 @@ upload          Boolean
 download        "yes", "no", "deps", "forced" or "forced-deps"
 sandbox         Boolean
 clean_checkout  Boolean
+always_checkout List of strings (regular expression patterns)
 =============== ===================================================================
+
+graph
+^^^^^
+
+Set default graph arguments here. See :ref:`manpage-graph` for details.
+
+Supported arguments and their type:
+
+=============== ===================================================================
+Key             Type
+=============== ===================================================================
+options         Dictonary of String key value pairs
+type            "d3" or "dot"
+max_depth       Integer
+=============== ===================================================================
+
+hooks
+~~~~~
+
+Hooks are other programs or scripts that can be executed by Bob at certain
+points, e.g. before or after a build. Unless otherwise noted they are executed
+with the project root directory as working directory. Example::
+
+    hooks:
+        postBuildHook: ./contrib/notify.sh
+
+where ``contrib/notify.sh`` is::
+
+    #!/bin/bash
+    HEADLINE="Bob build finished"
+    BODY="The build in $PWD has finished: $1"
+    if [[ ${XDG_CURRENT_DESKTOP:-unknown} == KDE ]] ; then
+        kdialog --passivepopup "$BODY" 10 --title "$HEADLINE"
+    else
+        notify-send -u normal -t 10000 "$HEADLINE" "$BODY"
+    fi
+
+The currently supported hooks are described below.
+
+preBuildHook
+    The pre-build hook is run directly before a local build (bob dev / bob
+    build). It receives the paths of all packages that are built as arguments.
+
+    If the hook returns with a non-zero status the build will be interrupted.
+
+postBuildHook 
+    The post-build hook is run after a local build finished, regardless if the
+    build succeeded or failed. It receives the status as first argument
+    (``success`` or ``fail``) and the relative paths to the workspaces of the
+    results as further arguments.
+
+    The return status of the hook is ignored.
+

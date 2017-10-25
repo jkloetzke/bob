@@ -19,6 +19,7 @@ from ..archive import getArchiver
 from ..errors import ParseError, BuildError
 from ..input import RecipeSet
 from ..state import BobState
+from ..stringparser import isTrue
 from ..tty import WarnOnce
 from ..utils import asHexStr
 from pipes import quote
@@ -136,7 +137,7 @@ class JenkinsJob:
         self.__displayName = displayName
         self.__nameCalculator = nameCalculator
         self.__recipe = recipe
-        self.__isRoot = recipe.isRoot()
+        self.__isRoot = False
         self.__archive = archiveBackend
         self.__checkoutSteps = {}
         self.__buildSteps = {}
@@ -154,6 +155,9 @@ class JenkinsJob:
 
     def isRoot(self):
         return self.__isRoot
+
+    def makeRoot(self):
+        self.__isRoot = True
 
     def getDescription(self, date):
         description = [
@@ -413,6 +417,31 @@ class JenkinsJob:
         ret.append(line)
         return "\n".join(ret)
 
+    def dumpStepLiveBuildIdGen(self, step):
+        # this makes only sense if we can upload the result
+        if not self.__archive.canUploadJenkins():
+            return []
+
+        # Get calculation spec. May be None if step is indeterministic or some
+        # SCM does not support live build-ids.
+        spec = step.getLiveBuildIdSpec()
+        if spec is None:
+            return []
+
+        buildId = JenkinsJob._buildIdName(step)
+        liveBuildId = JenkinsJob._liveBuildIdName(step)
+        ret = [ "bob-hash-engine --state .state -o {} <<'EOF'".format(liveBuildId),
+                spec, "EOF" ]
+        ret.append(self.__archive.uploadJenkinsLiveBuildId(step, liveBuildId, buildId))
+
+        # Without sandbox we only upload the live build-id on the initial
+        # checkout. Otherwise accidential modifications of the sources can
+        # happen in later build steps.
+        if step.getSandbox() is None:
+            ret = [ "if [[ ! -e {} ]] ; then".format(liveBuildId) ] + ret + [ "fi" ]
+
+        return ret
+
     @staticmethod
     def _tgzName(d):
         return d.getWorkspacePath().replace('/', '_') + ".tgz"
@@ -420,6 +449,10 @@ class JenkinsJob:
     @staticmethod
     def _buildIdName(d):
         return d.getWorkspacePath().replace('/', '_') + ".buildid"
+
+    @staticmethod
+    def _liveBuildIdName(d):
+        return d.getWorkspacePath().replace('/', '_') + ".live-buildid"
 
     @staticmethod
     def _envName(d):
@@ -510,7 +543,7 @@ class JenkinsJob:
             triggers, "hudson.triggers.SCMTrigger")
         xml.etree.ElementTree.SubElement(scmTrigger, "spec").text = options.get("scm.poll")
         xml.etree.ElementTree.SubElement(
-            scmTrigger, "ignorePostCommitHooks").text = "false"
+            scmTrigger, "ignorePostCommitHooks").text = ("true" if isTrue(options.get("scm.ignore-hooks", "false")) else "false")
 
         sharedDir = options.get("shared.dir", "${JENKINS_HOME}/bob")
 
@@ -558,6 +591,7 @@ class JenkinsJob:
             whiteList.extend([ JenkinsJob._tgzName(d) for d in self.__deps.values()])
         whiteList.extend([ JenkinsJob._buildIdName(d) for d in self.__deps.values()])
         whiteList.extend([ d.getWorkspacePath() for d in self.__checkoutSteps.values() ])
+        whiteList.extend([ JenkinsJob._liveBuildIdName(d) for d in self.__checkoutSteps.values() ])
         whiteList.extend([ d.getWorkspacePath() for d in self.__buildSteps.values() ])
         prepareCmds.extend(wrapCommandArguments("pruneUnused", sorted(whiteList)))
         prepareCmds.append("set -x")
@@ -719,6 +753,7 @@ class JenkinsJob:
         ]
         for d in sorted(self.__checkoutSteps.values()):
             buildIdCalc.extend(self.dumpStepBuildIdGen(d))
+            buildIdCalc.extend(self.dumpStepLiveBuildIdGen(d))
         for d in sorted(self.__buildSteps.values()):
             buildIdCalc.extend(self.dumpStepBuildIdGen(d))
         for d in sorted(self.__packageSteps.values()):
@@ -1044,11 +1079,12 @@ class JobNameCalculator:
 
 
 def _genJenkinsJobs(step, jobs, nameCalculator, archiveBackend, seenPackages, allVariantIds,
-                    shortdescription=False):
+                    shortdescription):
 
     if step.isPackageStep() and shortdescription:
         if step.getVariantId() in allVariantIds:
-            return
+            name = nameCalculator.getJobInternalName(step)
+            return jobs[name]
         else:
             allVariantIds.add(step.getVariantId())
 
@@ -1089,6 +1125,8 @@ def _genJenkinsJobs(step, jobs, nameCalculator, archiveBackend, seenPackages, al
                 seenPackages.add(stack)
                 _genJenkinsJobs(sandboxStep, jobs, nameCalculator, archiveBackend,
                                 seenPackages, allVariantIds, shortdescription)
+
+    return jj
 
 def jenkinsNameFormatter(step, props):
     return step.getPackage().getName().replace('::', "/") + "/" + step.getLabel()
@@ -1136,8 +1174,9 @@ def genJenkinsJobs(recipes, jenkins):
     nameCalculator.isolate(options.get("jobs.isolate"))
     nameCalculator.sanitize()
     for root in sorted(rootPackages, key=lambda root: root.getName()):
-        _genJenkinsJobs(root.getPackageStep(), jobs, nameCalculator, archiveHandler, set(), set(),
+        rootJenkinsJob = _genJenkinsJobs(root.getPackageStep(), jobs, nameCalculator, archiveHandler, set(), set(),
                         config.get('shortdescription', False))
+        rootJenkinsJob.makeRoot()
 
     return jobs
 

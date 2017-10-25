@@ -20,7 +20,7 @@ from .pathspec import PackageSet
 from .scm import CvsScm, GitScm, SvnScm, UrlScm, ScmOverride, auditFromDir
 from .state import BobState
 from .stringparser import checkGlobList, Env, DEFAULT_STRING_FUNS
-from .tty import colorize, WarnOnce
+from .tty import colorize, InfoOnce, WarnOnce
 from .utils import asHexStr, joinScripts, sliceString, compareVersion, binStat, updateDicRecursive
 from abc import ABCMeta, abstractmethod
 from base64 import b64encode
@@ -428,7 +428,7 @@ class CoreStepRef:
 class CoreStep(metaclass=ABCMeta):
     __slots__ = ( "package", "label", "tools", "digestEnv", "env", "args",
         "shared", "doesProvideTools", "providedEnv", "providedTools",
-        "providedDeps", "providedSandbox", "variantId", "sandbox" )
+        "providedDeps", "providedSandbox", "variantId", "sandbox", "sbxVarId" )
 
     def __init__(self, step, label, tools, sandbox, digestEnv, env, args, shared):
         package = step.getPackage()
@@ -644,6 +644,15 @@ class Step(metaclass=ABCMeta):
             ret = self._coreStep.variantId
         except AttributeError:
             ret = self._coreStep.variantId = self.getDigest(lambda step: step.getVariantId())
+        return ret
+
+    def _getSandboxVariantId(self):
+        try:
+            ret = self._coreStep.sbxVarId
+        except AttributeError:
+            ret = self._coreStep.sbxVarId = self.getDigest(
+                lambda step: step._getSandboxVariantId(),
+                True)
         return ret
 
     def _getResultId(self):
@@ -932,6 +941,61 @@ class CheckoutStep(Step):
         return ( self._coreStep.deterministic and
                  all([ s.isDeterministic() for s in self._coreStep.scmList ]) and
                  super().isDeterministic() )
+
+    def hasLiveBuildId(self):
+        """Check if live build-ids are supported.
+
+        This must be supported by all SCMs. Additionally the checkout script
+        must be deterministic.
+        """
+        return ( self._coreStep.deterministic and
+                 all(s.hasLiveBuildId() for s in self._coreStep.scmList) and
+                 super().isDeterministic() )
+
+    def predictLiveBuildId(self):
+        """Query server to predict live build-id.
+
+        Returns the live-build-id or None if an SCM query failed.
+        """
+        if not self.hasLiveBuildId():
+            return None
+        h = hashlib.sha1()
+        h.update(self._getSandboxVariantId())
+        for s in self._coreStep.scmList:
+            for liveBId in s.predictLiveBuildId():
+                if liveBId is None: return None
+                h.update(liveBId)
+        return h.digest()
+
+    def calcLiveBuildId(self):
+        """Calculate live build-id from workspace."""
+        if not self.hasLiveBuildId():
+            return None
+        workspacePath = self.getWorkspacePath()
+        h = hashlib.sha1()
+        h.update(self._getSandboxVariantId())
+        for s in self._coreStep.scmList:
+            for liveBId in s.calcLiveBuildId(workspacePath):
+                if liveBId is None: return None
+                h.update(liveBId)
+        return h.digest()
+
+    def getLiveBuildIdSpec(self):
+        """Generate spec lines for bob-hash-engine.
+
+        May return None if an SCM does not support live-build-ids on Jenkins.
+        """
+        if not self.hasLiveBuildId():
+            return None
+        workspacePath = self.getWorkspacePath()
+        lines = [ "{sha1", "=" + asHexStr(self._getSandboxVariantId()) ]
+        for s in self._coreStep.scmList:
+            for liveBIdSpec in s.getLiveBuildIdSpec(workspacePath):
+                if liveBIdSpec is None: return None
+                lines.append(liveBIdSpec)
+        lines.append("}")
+        return "\n".join(lines)
+
 
 class RegularStep(Step):
     def construct(self, package, pathFormatter, sandbox, label, script=(None, None),
@@ -1407,7 +1471,7 @@ class Recipe(object):
         return list(collect(recipeSet.loadYaml(fileName, fileSchema), "", None))
 
     @staticmethod
-    def createVirtualRoot(recipeSet, roots):
+    def createVirtualRoot(recipeSet, roots, properties):
         recipe = {
             "depends" : [
                 { "name" : name, "use" : ["result"] } for name in roots
@@ -1415,7 +1479,7 @@ class Recipe(object):
             "buildScript" : "true",
             "packageScript" : "true"
         }
-        ret = Recipe(recipeSet, recipe, "", ".", "", "", {})
+        ret = Recipe(recipeSet, recipe, "", ".", "", "", properties)
         ret.resolveClasses()
         return ret
 
@@ -1719,7 +1783,7 @@ class Recipe(object):
         env.update(self.__metaEnv)
 
         # filter duplicate results, fail on different variants of same package
-        self.__filterDuplicateSteps(results)
+        results = self.__filterDuplicateSteps(results)
 
         # record used environment and tools
         env.touch(self.__packageVars | self.__packageVarsWeak)
@@ -1782,8 +1846,7 @@ class Recipe(object):
             if subDep is not None:
                 provideDeps.append(subDep)
                 for d in subDep._getProvidedDeps(): provideDeps.append(d)
-        self.__filterDuplicateSteps(provideDeps)
-        packageStep._setProvidedDeps(provideDeps)
+        packageStep._setProvidedDeps(self.__filterDuplicateSteps(provideDeps))
 
         # provide Sandbox
         if self.__provideSandbox:
@@ -1812,24 +1875,22 @@ class Recipe(object):
         return p, subTreePackages
 
     def __filterDuplicateSteps(self, results):
-        i = 0
-        while i < len(results):
-            j = i+1
-            r = results[i]
-            while j < len(results):
-                if r.getPackage().getName() == results[j].getPackage().getName():
-                    if r.getVariantId() != results[j].getVariantId():
-                        raise ParseError("Incompatibe variants of package: {} vs. {}"
-                            .format("/".join(r.getPackage().getStack()),
-                                    "/".join(results[j].getPackage().getStack())),
-                            help=
+        cache = {}
+        ret = []
+        for r in results:
+            r2 = cache.setdefault(r.getPackage().getName(), r)
+            if r2 is r:
+                ret.append(r)
+            elif r.getVariantId() != r2.getVariantId():
+                raise ParseError("Incompatibe variants of package: {} vs. {}"
+                    .format("/".join(r.getPackage().getStack()),
+                            "/".join(r2.getPackage().getStack())),
+                    help=
 """This error is caused by '{PKG}' that is passed upwards via 'provideDeps' from multiple dependencies of '{CUR}'.
 These dependencies constitute different variants of '{PKG}' and can therefore not be used in '{CUR}'."""
     .format(PKG=r.getPackage().getName(), CUR=self.__packageName))
-                    del results[j]
-                else:
-                    j += 1
-            i += 1
+
+        return ret
 
 class PackageMatcher:
     def __init__(self, package, env, tools, states, sandbox, subTreePackages):
@@ -1928,6 +1989,14 @@ class RecipeSet:
             schema.Optional('download') : schema.Or("yes", "no", "deps", "forced", "forced-deps"),
             schema.Optional('sandbox') : bool,
             schema.Optional('clean_checkout') : bool,
+            schema.Optional('always_checkout') : [str],
+        })
+
+    GRAPH_SCHEMA = schema.Schema(
+        {
+            schema.Optional('options') : schema.Schema({str : schema.Or(str, bool)}),
+            schema.Optional('type') : schema.Or("d3", "dot"),
+            schema.Optional('max_depth') : int,
         })
 
     USER_CONFIG_SCHEMA = schema.Schema(
@@ -1962,7 +2031,12 @@ class RecipeSet:
             }) ],
             schema.Optional('command') : schema.Schema({
                 schema.Optional('dev') : BUILD_DEV_SCHEMA,
-                schema.Optional('build') : BUILD_DEV_SCHEMA
+                schema.Optional('build') : BUILD_DEV_SCHEMA,
+                schema.Optional('graph') : GRAPH_SCHEMA
+            }),
+            schema.Optional('hooks') : schema.Schema({
+                schema.Optional('preBuildHook') : str,
+                schema.Optional('postBuildHook') : str,
             }),
         })
 
@@ -1998,9 +2072,18 @@ class RecipeSet:
         self.__plugins = {}
         self.__commandConfig = {}
         self.__policies = {
-            'relativeIncludes' : ("0.13", WarnOnce("relativeIncludes policy not set. Using recipes directory as base for all includes!")),
-            'cleanEnvironment' : ("0.13", WarnOnce("cleanEnvironment policy not set. Initial environment tainted by whitelisted variables!")),
+            'relativeIncludes' : (
+                "0.13",
+                InfoOnce("relativeIncludes policy not set. Using project root directory as base for all includes!",
+                    help="See http://bob-build-tool.readthedocs.io/en/latest/manual/policies.html#relativeincludes for more information.")
+            ),
+            'cleanEnvironment' : (
+                "0.13",
+                InfoOnce("cleanEnvironment policy not set. Initial environment tainted by whitelisted variables!",
+                    help="See http://bob-build-tool.readthedocs.io/en/latest/manual/policies.html#cleanenvironment for more information.")
+            ),
         }
+        self.__buildHooks = {}
 
     def __addRecipe(self, recipe):
         name = recipe.getPackageName()
@@ -2143,6 +2226,9 @@ class RecipeSet:
         else:
             return audit.getStatusLine()
 
+    def getBuildHook(self, name):
+        return self.__buildHooks.get(name)
+
     def loadBinary(self, path):
         return self.__cache.loadBinary(path)
 
@@ -2221,7 +2307,7 @@ class RecipeSet:
                 rootRecipes.append(recipe.getPackageName())
 
         # create virtual root package
-        self.__rootRecipe = Recipe.createVirtualRoot(self, sorted(rootRecipes))
+        self.__rootRecipe = Recipe.createVirtualRoot(self, sorted(rootRecipes), self.__properties)
         self.__addRecipe(self.__rootRecipe)
 
     def __parseUserConfig(self, fileName, relativeIncludes=None):
@@ -2236,6 +2322,7 @@ class RecipeSet:
         self.__aliases.update(cfg.get("alias", {}))
         if not self._ignoreCmdConfig:
             self.__commandConfig = updateDicRecursive(self.__commandConfig, cfg.get("command", {}))
+        self.__buildHooks.update(cfg.get("hooks", {}))
         for p in cfg.get("include", []):
             p = os.path.join(os.path.dirname(fileName), p) if relativeIncludes else p
             self.__parseUserConfig(p + ".yaml", relativeIncludes)
@@ -2417,7 +2504,7 @@ class RecipeSet:
     def getPolicy(self, name, location=None):
         (policy, warning) = self.__policies[name]
         if policy is None:
-            warning.warn(location)
+            warning.show(location)
         return policy
 
 
