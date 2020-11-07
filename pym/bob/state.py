@@ -10,10 +10,29 @@ import errno
 import os
 import pickle
 import sqlite3
+import struct
+import zlib
 
 warnNoAttic = WarnOnce(
     "Project was created by old Bob version. Attic directories listing will be incomplete.",
     help="Attic directires were not tracked by Bob version 0.14 and below.")
+
+class DigestAdder:
+    """Append a checksum by compuing it on-the-fly"""
+    def __init__(self, fd):
+        self.fd = fd
+        self.csum = 1
+
+    def write(self, data):
+        self.csum = zlib.adler32(data, self.csum)
+        return self.fd.write(data)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.fd.write(struct.pack("L", self.csum))
+        return False
 
 class _BobState():
     # Bump CUR_VERSION if internal state is made backwards incompatible, that is
@@ -35,6 +54,7 @@ class _BobState():
     instance = None
     def __init__(self):
         self.__path = ".bob-state.pickle"
+        self.__uncommittedPath = self.__path + ".new"
         self.__byNameDirs = {}
         self.__results = {}
         self.__inputs = {}
@@ -64,6 +84,10 @@ class _BobState():
         else:
             self.__lock = lockFile
             os.close(fd)
+
+        # Commit old state if valid. It may have been left behind if Bob or the
+        # machine crashed really hard.
+        self.__commit()
 
         # load state if it exists
         try:
@@ -134,18 +158,47 @@ class _BobState():
                 "atticDirs" : self.__atticDirs,
                 "createdWithVersion" : self.__createdWithVersion,
             }
-            tmpFile = self.__path+".new"
             try:
-                with open(tmpFile, "wb") as f:
-                    pickle.dump(state, f)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmpFile, self.__path)
+                with open(self.__uncommittedPath, "wb") as f:
+                    with DigestAdder(f) as df:
+                        pickle.dump(state, df)
             except OSError as e:
                 raise ParseError("Error saving workspace state: " + str(e))
             self.__dirty = False
         else:
             self.__dirty = True
+
+    def __commit(self, verify=True):
+        if not os.path.exists(self.__uncommittedPath):
+            return
+
+        try:
+            commit = True
+            with open(self.__uncommittedPath, "rb") as f:
+                if verify:
+                    data = f.read()
+                    csum = struct.pack("L", zlib.adler32(data[:-4]))
+                    commit = csum == data[-4:]
+                os.fsync(f.fileno())
+            if commit:
+                os.replace(self.__uncommittedPath, self.__path)
+                return
+            else:
+                print(colorize("Warning: discarding corrupted worspace state!", "33"),
+                    file=stderr)
+                print("You might experience build problems because state changes of the last invocation were lost.",
+                    file=stderr)
+        except OSError as e:
+            print(colorize("Warning: cannot commit worspace state: "+str(e), "33"),
+                file=stderr)
+
+        try:
+            os.unlink(self.__uncommittedPath)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            print(colorize("Warning: cannot delete corrupted state: "+str(e), "33"),
+                file=stderr)
 
     def __openBIdCache(self):
         if self.__buildIdCache is None:
@@ -160,6 +213,7 @@ class _BobState():
 
     def finalize(self):
         assert (self.__asynchronous == 0) and not self.__dirty
+        self.__commit(False)
         if self.__buildIdCache is not None:
             try:
                 self.__buildIdCache.execute("END")
