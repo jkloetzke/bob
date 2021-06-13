@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-import asyncio
+import base64
 import hashlib
 import os.path
 import struct
@@ -97,6 +97,12 @@ class StepIR(AbstractIR):
             self.__data['toolKeysWeak'] = sorted(step._coreStep.toolDepWeak)
             self.__data['digestEnv'] = step._coreStep.digestEnv
             self.__data['auditFileNames'] = step.getAuditFileNames()
+            # For Jenkins backends the files must be converted to a string.
+            # Binary data cannot be serialized as JSON.
+            self.__data['includedFiles'] = {
+                k : base64.a85encode(v).decode('ascii')
+                for k, v in step.getIncludedFiles().items()
+            } if self.JENKINS else step.getIncludedFiles()
 
         return self
 
@@ -396,6 +402,12 @@ class StepIR(AbstractIR):
 
     def getAuditFileNames(self):
         return self.__data['auditFileNames']
+
+    def getIncludedFiles(self):
+        ret = self.__data['includedFiles']
+        if self.JENKINS:
+            ret = { k : base64.a85decode(v) for k, v in ret.items() }
+        return ret
 
 
 class PackageIR(AbstractIR):

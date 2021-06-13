@@ -147,10 +147,11 @@ def fetchScripts(recipe, prefix, resolveBash, resolvePwsh):
 def mergeScripts(fragments, glue):
     """Join all scripts of the recipe and its classes.
 
-    The result is a tuple with (setupScript, mainScript, digestScript). Note
-    that the mainScript contains all "normal" scripts and all "Finalize"
-    scripts in reverse order.
+    The result is a tuple with (setupScript, mainScript, digestScript,
+    includedFiles). Note that the mainScript contains all "normal" scripts and
+    all "Finalize" scripts in reverse order.
     """
+
     return (
         # The "Setup" scripts
         joinScripts((f[0][0] for f in fragments), glue),
@@ -162,7 +163,10 @@ def mergeScripts(fragments, glue):
             ( joinScripts((f[0][1] for f in fragments), "\n"),
               joinScripts((f[1][1] for f in fragments), "\n"),
               joinScripts((f[2][1] for f in fragments), "\n"),
-            ), "\n")
+            ), "\n"),
+        { name : content for name, content in
+                         chain.from_iterable(chain(f[0][2].items(), f[1][2].items()) for f in fragments)
+        },
     )
 
 
@@ -893,6 +897,9 @@ class CoreStep(CoreItem):
     def getUpdateScript(self):
         return ""
 
+    def getIncludedFiles(self):
+        raise NotImplementedError
+
     def getLabel(self):
         raise NotImplementedError
 
@@ -1126,6 +1133,9 @@ class Step:
 
     def isUpdateDeterministic(self):
         return self._coreStep.isUpdateDeterministic()
+
+    def getIncludedFiles(self):
+        return self._coreStep.getIncludedFiles()
 
     def isDeterministic(self):
         """Return whether the step is deterministic.
@@ -1418,6 +1428,9 @@ class CoreCheckoutStep(CoreStep):
         glue = getLanguage(self.corePackage.recipe.scriptLanguage.index).glue
         return joinScripts(self.__checkoutUpdateIf, glue) or ""
 
+    def getIncludedFiles(self):
+        return self.corePackage.recipe.checkoutIncludedFiles
+
     @property
     def fingerprintMask(self):
         return 0
@@ -1451,7 +1464,7 @@ class CheckoutStep(Step):
 class CoreBuildStep(CoreStep):
     __slots__ = ["fingerprintMask"]
 
-    def __init__(self, corePackage, script=(None, None, None), digestEnv=Env(),
+    def __init__(self, corePackage, script=(None, None, None, {}), digestEnv=Env(),
                  env=Env(), args=[], fingerprintMask=0, toolDep=set(), toolDepWeak=set(),
                  auditFileNames={}):
         isValid = script[1] is not None
@@ -1480,6 +1493,9 @@ class CoreBuildStep(CoreStep):
     def getDigestScript(self):
         return self.corePackage.recipe.buildDigestScript
 
+    def getIncludedFiles(self):
+        return self.corePackage.recipe.buildIncludedFiles
+
 class BuildStep(Step):
 
     def hasNetAccess(self):
@@ -1490,7 +1506,7 @@ class BuildStep(Step):
 class CorePackageStep(CoreStep):
     __slots__ = ["fingerprintMask"]
 
-    def __init__(self, corePackage, script=(None, None, None), digestEnv=Env(), env=Env(), args=[],
+    def __init__(self, corePackage, script=(None, None, None, {}), digestEnv=Env(), env=Env(), args=[],
                  fingerprintMask=0, toolDep=set(), toolDepWeak=set(), auditFileNames={}):
         isValid = script[1] is not None
         self.fingerprintMask = fingerprintMask
@@ -1517,6 +1533,9 @@ class CorePackageStep(CoreStep):
 
     def getDigestScript(self):
         return self.corePackage.recipe.packageDigestScript
+
+    def getIncludedFiles(self):
+        return self.corePackage.recipe.packageIncludedFiles
 
 class PackageStep(Step):
 
@@ -1810,7 +1829,7 @@ class IncludeHelper:
                 raise ParseError("Bad substiturion in {}: {}".format(section, str(e)))
             return resolver.resolve(ret)
         else:
-            return (None, None)
+            return (None, None, {})
 
 class ScmValidator:
     def __init__(self, scmSpecs):
@@ -2434,7 +2453,7 @@ class Recipe(object):
 
         # the package step must always be valid
         if self.__package[1] is None:
-            self.__package = (None, "", 'da39a3ee5e6b4b0d3255bfef95601890afd80709')
+            self.__package = (None, "", 'da39a3ee5e6b4b0d3255bfef95601890afd80709', {})
 
         if self.__relocatable is None:
             self.__relocatable = True
@@ -2849,7 +2868,7 @@ class Recipe(object):
                 packageName, isShared)
 
         # optional checkout step
-        if self.__checkout != (None, None, None) or self.__checkoutSCMs or self.__checkoutAsserts:
+        if self.__checkout != (None, None, None, {}) or self.__checkoutSCMs or self.__checkoutAsserts:
             checkoutDigestEnv = env.prune(self.__checkoutVars)
             checkoutEnv = ( env.prune(self.__checkoutVars | self.__checkoutVarsWeak)
                 if self.__checkoutVarsWeak else checkoutDigestEnv )
@@ -2877,7 +2896,7 @@ class Recipe(object):
             srcCoreStep = p.createInvalidCoreCheckoutStep()
 
         # optional build step
-        if self.__build != (None, None, None):
+        if self.__build != (None, None, None, {}):
             buildDigestEnv = env.prune(self.__buildVars)
             buildEnv = ( env.prune(self.__buildVars | self.__buildVarsWeak)
                 if self.__buildVarsWeak else buildDigestEnv )
@@ -2991,6 +3010,10 @@ Every dependency must only be given once."""
         return self.__checkout[2] or ""
 
     @property
+    def checkoutIncludedFiles(self):
+        return self.__checkout[3]
+
+    @property
     def checkoutDeterministic(self):
         return self.__checkoutDeterministic
 
@@ -3019,6 +3042,10 @@ Every dependency must only be given once."""
         return self.__build[2]
 
     @property
+    def buildIncludedFiles(self):
+        return self.__build[3]
+
+    @property
     def buildVars(self):
         return self.__buildVars
 
@@ -3037,6 +3064,10 @@ Every dependency must only be given once."""
     @property
     def packageDigestScript(self):
         return self.__package[2]
+
+    @property
+    def packageIncludedFiles(self):
+        return self.__package[3]
 
     @property
     def packageVars(self):
