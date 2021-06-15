@@ -5,7 +5,7 @@
 
 from . import BOB_VERSION, BOB_INPUT_HASH, DEBUG
 from .errors import ParseError, BobError
-from .languages import getLanguage, ScriptLanguage, BashLanguage, PwshLanguage
+from .languages import getLanguage, ScriptLanguage, BashLanguage, PwshLanguage, PythonLanguage
 from .pathspec import PackageSet
 from .scm import CvsScm, GitScm, ImportScm, SvnScm, UrlScm, ScmOverride, \
     auditFromDir, auditFromProperties, getScm, SYNTHETIC_SCM_PROPS
@@ -122,9 +122,11 @@ def fetchFingerprintScripts(recipe):
             recipe.get("fingerprintScript")),
         ScriptLanguage.PWSH : recipe.get("fingerprintScriptPwsh",
             recipe.get("fingerprintScript")),
+        ScriptLanguage.PYTHON : recipe.get("fingerprintScriptPython",
+            recipe.get("fingerprintScript")),
     }
 
-def fetchScripts(recipe, prefix, resolveBash, resolvePwsh):
+def fetchScripts(recipe, prefix, resolveBash, resolvePwsh, resolvePython):
     return {
         ScriptLanguage.BASH : (
             resolveBash(recipe.get(prefix + "SetupBash", recipe.get(prefix + "Setup")),
@@ -141,7 +143,15 @@ def fetchScripts(recipe, prefix, resolveBash, resolvePwsh):
                         prefix + "Script[Pwsh]"),
             resolvePwsh(recipe.get(prefix + "FinalizePwsh", recipe.get(prefix + "Finalize")),
                         prefix + "Finalize[Pwsh]"),
-        )
+        ),
+        ScriptLanguage.PYTHON : (
+            resolvePython(recipe.get(prefix + "SetupPython", recipe.get(prefix + "Setup")),
+                          prefix + "Setup[Python]"),
+            resolvePython(recipe.get(prefix + "ScriptPython", recipe.get(prefix + "Script")),
+                          prefix + "Script[Python]"),
+            resolvePython(recipe.get(prefix + "FinalizePython", recipe.get(prefix + "Finalize")),
+                          prefix + "Finalize[Python]"),
+        ),
     }
 
 def mergeScripts(fragments, glue):
@@ -2285,9 +2295,11 @@ class Recipe(object):
                                       baseDir, packageName, sourceName).resolve
         incHelperPwsh = IncludeHelper(PwshLanguage, recipeSet.loadBinary,
                                       baseDir, packageName, sourceName).resolve
+        incHelperPython = IncludeHelper(PythonLanguage, recipeSet.loadBinary,
+                                        baseDir, packageName, sourceName).resolve
 
         self.__scriptLanguage = recipe.get("scriptLanguage")
-        self.__checkout = fetchScripts(recipe, "checkout", incHelperBash, incHelperPwsh)
+        self.__checkout = fetchScripts(recipe, "checkout", incHelperBash, incHelperPwsh, incHelperPython)
         self.__checkoutSCMs = recipe.get("checkoutSCM", [])
         for scm in self.__checkoutSCMs:
             scm["__source"] = sourceName
@@ -2298,8 +2310,8 @@ class Recipe(object):
             a["__source"] = sourceName + ", checkoutAssert #{}".format(i)
             i += 1
         self.__checkoutUpdateIf = recipe["checkoutUpdateIf"]
-        self.__build = fetchScripts(recipe, "build", incHelperBash, incHelperPwsh)
-        self.__package = fetchScripts(recipe, "package", incHelperBash, incHelperPwsh)
+        self.__build = fetchScripts(recipe, "build", incHelperBash, incHelperPwsh, incHelperPython)
+        self.__package = fetchScripts(recipe, "package", incHelperBash, incHelperPwsh, incHelperPython)
         self.__fingerprintScriptList = fetchFingerprintScripts(recipe)
         self.__fingerprintIf = recipe.get("fingerprintIf")
         self.__fingerprintVarsList = set(recipe.get("fingerprintVars", []))
@@ -3429,7 +3441,7 @@ class RecipeSet:
         ),
         schema.Optional('layers') : [LayerValidator()],
         schema.Optional('scriptLanguage',
-                        default=ScriptLanguage.BASH) : schema.And(schema.Or("bash", "PowerShell"),
+                        default=ScriptLanguage.BASH) : schema.And(schema.Or("bash", "PowerShell", "python"),
                                                                   schema.Use(ScriptLanguage)),
     }
 
@@ -4217,31 +4229,40 @@ class RecipeSet:
             schema.Optional('checkoutFinalize') : str,
             schema.Optional('checkoutFinalizeBash') : str,
             schema.Optional('checkoutFinalizePwsh') : str,
+            schema.Optional('checkoutFinalizePython') : str,
             schema.Optional('checkoutScript') : str,
             schema.Optional('checkoutScriptBash') : str,
             schema.Optional('checkoutScriptPwsh') : str,
+            schema.Optional('checkoutScriptPython') : str,
             schema.Optional('checkoutSetup') : str,
             schema.Optional('checkoutSetupBash') : str,
             schema.Optional('checkoutSetupPwsh') : str,
+            schema.Optional('checkoutSetupPython') : str,
             schema.Optional('checkoutUpdateIf', default=False) : schema.Or(None, str, bool, IfExpression),
             schema.Optional('buildFinalize') : str,
             schema.Optional('buildFinalizeBash') : str,
             schema.Optional('buildFinalizePwsh') : str,
+            schema.Optional('buildFinalizePython') : str,
             schema.Optional('buildScript') : str,
             schema.Optional('buildScriptBash') : str,
             schema.Optional('buildScriptPwsh') : str,
+            schema.Optional('buildScriptPython') : str,
             schema.Optional('buildSetup') : str,
             schema.Optional('buildSetupBash') : str,
             schema.Optional('buildSetupPwsh') : str,
+            schema.Optional('buildSetupPython') : str,
             schema.Optional('packageFinalize') : str,
             schema.Optional('packageFinalizeBash') : str,
             schema.Optional('packageFinalizePwsh') : str,
+            schema.Optional('packageFinalizePython') : str,
             schema.Optional('packageScript') : str,
             schema.Optional('packageScriptBash') : str,
             schema.Optional('packageScriptPwsh') : str,
+            schema.Optional('packageScriptPython') : str,
             schema.Optional('packageSetup') : str,
             schema.Optional('packageSetupBash') : str,
             schema.Optional('packageSetupPwsh') : str,
+            schema.Optional('packageSetupPython') : str,
             schema.Optional('checkoutTools') : [ ToolValidator(toolNameSchema) ],
             schema.Optional('buildTools') : [ ToolValidator(toolNameSchema) ],
             schema.Optional('packageTools') : [ ToolValidator(toolNameSchema) ],
@@ -4274,6 +4295,7 @@ class RecipeSet:
                         schema.Optional('fingerprintScript', default="") : str,
                         schema.Optional('fingerprintScriptBash') : str,
                         schema.Optional('fingerprintScriptPwsh') : str,
+                        schema.Optional('fingerprintScriptPython') : str,
                         schema.Optional('fingerprintIf') : schema.Or(None, str, bool, IfExpression),
                         schema.Optional('fingerprintVars') : [ varNameUseSchema ],
                         schema.Optional('dependTools') : [ ToolValidator(varNameUseSchema) ],
@@ -4297,9 +4319,10 @@ class RecipeSet:
             schema.Optional('fingerprintScript', default="") : str,
             schema.Optional('fingerprintScriptBash') : str,
             schema.Optional('fingerprintScriptPwsh') : str,
+            schema.Optional('fingerprintScriptPython') : str,
             schema.Optional('fingerprintIf') : schema.Or(None, str, bool, IfExpression),
             schema.Optional('fingerprintVars') : [ varNameUseSchema ],
-            schema.Optional('scriptLanguage') : schema.And(schema.Or("bash", "PowerShell"),
+            schema.Optional('scriptLanguage') : schema.And(schema.Or("bash", "PowerShell", "python"),
                                                            schema.Use(ScriptLanguage)),
             schema.Optional('jobServer') : schema.Or(bool, "pipe", "fifo", "fifo-or-pipe"),
             schema.Optional('packageDepends') : bool,
