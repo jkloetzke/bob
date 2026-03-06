@@ -2326,9 +2326,17 @@ class Recipe(object):
             raise ParseError("Cyclic class inheritence: " + " -> ".join(stack + [clsName]))
 
         # depth first
-        ret = []
-        subInherit = [ self.__recipeSet.getClass(c) for c in cls.__inherit ]
+        subInherit = []
+        if isRecipe:
+            subInherit.extend([ self.__recipeSet.getClass(c)
+                                for c in self.__recipeSet.getInheritPrepend() ])
+        subInherit.extend([ self.__recipeSet.getClass(c) for c in cls.__inherit ])
         if cls.__anonBaseClass: subInherit.insert(0, cls.__anonBaseClass)
+        if isRecipe:
+            subInherit.extend([ self.__recipeSet.getClass(c)
+                                for c in self.__recipeSet.getInheritAppend() ])
+
+        ret = []
         for c in subInherit:
             ret.extend(self.__resolveClassesOrder(c, stack + [clsName], visited))
 
@@ -3439,6 +3447,8 @@ class RecipeSet:
             },
             error="Invalid policy specified! Are you using an appropriate version of Bob?"
         ),
+        schema.Optional('inheritAppend') : [str],
+        schema.Optional('inheritPrepend') : [str],
         schema.Optional('layers') : [LayerValidator()],
         schema.Optional('scriptLanguage',
                         default=ScriptLanguage.BASH) : schema.And(schema.Or("bash", "PowerShell", "python"),
@@ -3542,6 +3552,8 @@ class RecipeSet:
         self.__scmDefaults = {}
         self.__preMirrors = []
         self.__fallbackMirrors = []
+        self.__inheritAppend = []
+        self.__inheritPrepend = []
 
         def appendArchive(x): self.__archive.extend(x)
         def prependArchive(x): self.__archive[0:0] = x
@@ -4173,6 +4185,12 @@ class RecipeSet:
         # project user config(s)
         self.__parseUserConfig(os.path.join(rootDir, "default.yaml"))
 
+        # For "inherit", classes are named from lowest to highest precedence.
+        # Thus, gather inheritPrepend/inheritAppend after parsing lower layers
+        # so that higher layers (higher precedence) come last.
+        self.__inheritPrepend.extend(config.get("inheritPrepend", []))
+        self.__inheritAppend.extend(config.get("inheritAppend", []))
+
         # color mode provided in cmd line takes precedence
         # (if no color mode provided by user, default one will be used)
         setColorMode(self._colorModeConfig or self.__uiConfig.get('color', 'auto'))
@@ -4353,6 +4371,12 @@ class RecipeSet:
                               "setting '"+name+"' has an invalid type"))
         self.__userConfigSchema = (schema.Schema(userConfigSchemaSpec), self.__pluginSettingsDeps)
 
+
+    def getInheritAppend(self):
+        return self.__inheritAppend
+
+    def getInheritPrepend(self):
+        return self.__inheritPrepend
 
     def getRecipes(self):
         return self.__recipes.keys()
