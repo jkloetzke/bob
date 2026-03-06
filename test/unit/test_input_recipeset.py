@@ -2777,3 +2777,154 @@ class TestAuditFiles(RecipesTmp, TestCase):
         filename, encoding = p.getPackageStep().getAuditFileNames()["BAR"]
         self.assertEqual(filename, "bar")
         self.assertEqual(encoding, "utf-8")
+
+
+class TestGlobalInherit(RecipesTmp, TestCase):
+    """Tests for inheritAppend and inheritPrepend in config.yaml"""
+
+    def testInheritAppend(self):
+        """inheritAppend causes all recipes to inherit the specified class"""
+        self.writeRecipe("root", """\
+            root: True
+            packageVars: [FOO]
+            """)
+        self.writeClass("base", """\
+            environment:
+                FOO: "from-base"
+            """)
+        self.writeConfig({"inheritAppend" : ["base"]})
+
+        p = self.generate().walkPackagePath("root")
+        self.assertEqual({"FOO" : "from-base"}, p.getPackageStep().getEnv())
+
+    def testInheritPrepend(self):
+        """inheritPrepend causes all recipes to inherit the specified class"""
+        self.writeRecipe("root", """\
+            root: True
+            packageVars: [FOO]
+            """)
+        self.writeClass("base", """\
+            environment:
+                FOO: "from-base"
+            """)
+        self.writeConfig({"inheritPrepend" : ["base"]})
+
+        p = self.generate().walkPackagePath("root")
+        self.assertEqual({"FOO" : "from-base"}, p.getPackageStep().getEnv())
+
+    def testInheritAppendPrepend(self):
+        """Both inheritAppend and inheritPrepend can be used together"""
+        self.writeRecipe("root", """\
+            root: True
+            packageVars: [FOO, BAR]
+            """)
+        self.writeClass("prepended", """\
+            environment:
+                FOO: "from-prepended"
+            """)
+        self.writeClass("appended", """\
+            environment:
+                BAR: "from-appended"
+            """)
+        self.writeConfig({"inheritPrepend" : ["prepended"],
+                          "inheritAppend"  : ["appended"]   })
+
+        p = self.generate().walkPackagePath("root")
+        self.assertEqual({"FOO" : "from-prepended", "BAR" : "from-appended"},
+                         p.getPackageStep().getEnv())
+
+    def testAppendOverridesExplicitInherit(self):
+        """Explicit recipe inherit comes before inheritAppend"""
+        self.writeRecipe("root", """\
+            root: True
+            packageVars: [FOO]
+            inherit: [explicit]
+            """)
+        self.writeClass("appended", """\
+            environment:
+                FOO: "from-appended"
+            """)
+        self.writeClass("explicit", """\
+            environment:
+                FOO: "from-explicit"
+            """)
+        self.writeConfig({"inheritAppend" : ["appended"]})
+
+        p = self.generate().walkPackagePath("root")
+        self.assertEqual({"FOO" : "from-appended"}, p.getPackageStep().getEnv())
+
+    def testExplicitInheritOverridesPrepend(self):
+        """Explicit recipe inherit comes after inheritPrepend"""
+        self.writeRecipe("root", """\
+            root: True
+            packageVars: [FOO]
+            inherit: [explicit]
+            """)
+        self.writeClass("prepended", """\
+            environment:
+                FOO: "from-prepended"
+            """)
+        self.writeClass("explicit", """\
+            environment:
+                FOO: "from-explicit"
+            """)
+        self.writeConfig({"inheritPrepend" : ["prepended"]})
+
+        p = self.generate().walkPackagePath("root")
+        self.assertEqual({"FOO" : "from-explicit"}, p.getPackageStep().getEnv())
+
+    def testLayerOrder(self):
+        """Higher layer inheritPre-/Append is coming after sub-layers"""
+        self.writeConfig({
+            "bobMinimumVersion" : "1.2",
+            "layers" : ["l1"],
+            "inheritPrepend" : ["root-prepend"],
+            "inheritAppend"  : ["root-append"],
+        })
+        self.writeClass("root-prepend", """\
+            packageScript: |
+                XXX root-prepend
+            """)
+        self.writeClass("root-append", """\
+            packageScript: |
+                XXX root-append
+            """)
+        self.writeRecipe("root", """\
+            root: True
+            packageVars: [FOO]
+            """)
+
+        self.writeClass("l1-prepend", """\
+            packageScript: |
+                XXX l1-prepend
+            """, layer=["l1"])
+        self.writeClass("l1-append", """\
+            packageScript: |
+                XXX l1-append
+            """, layer=["l1"])
+        self.writeConfig({
+            "layers" : ["l2"],
+            "inheritPrepend" : ["l1-prepend"],
+            "inheritAppend"  : ["l1-append"],
+        }, layer=["l1"])
+
+        self.writeClass("l2-prepend", """\
+            packageScript: |
+                XXX l2-prepend
+            """, layer=["l2"])
+        self.writeClass("l2-append", """\
+            packageScript: |
+                XXX l2-append
+            """, layer=["l2"])
+        self.writeConfig({
+            "inheritPrepend" : ["l2-prepend"],
+            "inheritAppend"  : ["l2-append"],
+        }, layer=["l2"])
+
+        p = self.generate().walkPackagePath("root")
+        # get all lines starting with XXX from final script
+        script = [l[4:] for l in p.getPackageStep().getMainScript().splitlines()
+                  if l.startswith("XXX")]
+        self.assertEqual(["l2-prepend", "l1-prepend", "root-prepend",
+                          "l2-append",  "l1-append",  "root-append"],
+                         script)
