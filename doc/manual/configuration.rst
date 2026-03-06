@@ -2325,6 +2325,50 @@ equal.
 .. _Semantic Versioning: http://semver.org/
 .. _PEP 440: https://www.python.org/dev/peps/pep-0440/
 
+.. _configuration-config-inheritAppend:
+
+inheritAppend
+~~~~~~~~~~~~~
+
+Type: List of Strings
+
+Defines a list of classes that are automatically appended to the ``inherit``
+list of every recipe in the project. This has the same effect as if every
+recipe had these classes at the end of their own ``inherit`` list::
+
+    inheritAppend: [defaults-variables]
+
+If multiple layers each specify ``inheritAppend``, the lists are accumulated.
+Sub-layers are accumulated first, so the root project's ``inheritAppend``
+entries appear last in the combined list. Effectively, this gives higher layers
+a higher precedence.
+
+See also :ref:`configuration-config-inheritPrepend`.
+
+.. _configuration-config-inheritPrepend:
+
+inheritPrepend
+~~~~~~~~~~~~~~
+
+Type: List of Strings
+
+Defines a list of classes that are automatically prepended to the ``inherit``
+list of every recipe in the project. This has the same effect as if every
+recipe had these classes at the beginning of their own ``inherit`` list::
+
+    inheritPrepend: [common-functions]
+
+A typical use case is a base class that provides common defaults (e.g. compiler
+settings, environment variables) that all recipes should start from, but which
+can be overridden by an explicit ``inherit`` in a recipe.
+
+If multiple layers each specify ``inheritPrepend``, the lists are accumulated.
+Sub-layers are accumulated first, so the root project's ``inheritPrepend``
+entries appear last in the combined list. Effectively, this gives higher layers
+a higher precedence.
+
+See also :ref:`configuration-config-inheritAppend`.
+
 .. _configuration-config-layers:
 
 layers
