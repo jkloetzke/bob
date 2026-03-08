@@ -373,7 +373,8 @@ class BashLanguage:
             f.write(BashLanguage.__formatProlog(spec, tmpDir, keepEnv))
             f.write(BashLanguage.__formatSetup(spec))
 
-        args = [getBashPath(), "--rcfile", BashLanguage.__munge(execScriptFile), "-s", "--"]
+        interpreter = spec.interpreterPath and os.path.abspath(spec.interpreterPath) or getBashPath()
+        args = [interpreter, "--rcfile", BashLanguage.__munge(execScriptFile), "-s", "--"]
         args.extend(BashLanguage.__munge(os.path.abspath(a)) for a in spec.args)
         return (realScriptFile, execScriptFile, args)
 
@@ -383,7 +384,8 @@ class BashLanguage:
         with open(realScriptFile, "w") as f:
             f.write(BashLanguage.__formatScript(spec, script, tmpDir))
 
-        args = [getBashPath()]
+        interpreter = spec.interpreterPath and os.path.abspath(spec.interpreterPath) or getBashPath()
+        args = [interpreter]
         if trace: args.append("-x")
         args.extend(["--", BashLanguage.__munge(execScriptFile)])
         args.extend(BashLanguage.__munge(os.path.abspath(a)) for a in spec.args)
@@ -418,7 +420,8 @@ class BashLanguage:
     @staticmethod
     def setupFingerprint(spec, env, trace):
         env["BOB_CWD"] = BashLanguage.__munge(env["BOB_CWD"])
-        args = [getBashPath()]
+        interpreter = spec.interpreterPath and os.path.abspath(spec.interpreterPath) or getBashPath()
+        args = [interpreter]
         if trace: args.append("-x")
         args.extend(["-c", spec.fingerprintScript])
         return args
@@ -576,7 +579,7 @@ class PwshLanguage:
             f.write(PwshLanguage.__formatProlog(spec, tmpDir))
             f.write(PwshLanguage.__formatSetup(spec))
 
-        interpreter = "powershell" if isWindows() else "pwsh"
+        interpreter = spec.interpreterPath and os.path.abspath(spec.interpreterPath) or ("powershell" if isWindows() else "pwsh")
         args = [interpreter, "-ExecutionPolicy", "Bypass", "-NoExit", "-File",
             PwshLanguage.__munge(execScriptFile)]
         args.extend(PwshLanguage.__munge(os.path.abspath(a)) for a in spec.args)
@@ -589,7 +592,7 @@ class PwshLanguage:
         with open(realScriptFile, "w") as f:
             f.write(PwshLanguage.__formatScript(spec, script, tmpDir, trace))
 
-        interpreter = "powershell" if isWindows() else "pwsh"
+        interpreter = spec.interpreterPath and os.path.abspath(spec.interpreterPath) or ("powershell" if isWindows() else "pwsh")
         args = [interpreter, "-ExecutionPolicy", "Bypass", "-File",
                 PwshLanguage.__munge(execScriptFile)]
         args.extend(PwshLanguage.__munge(os.path.abspath(a)) for a in spec.args)
@@ -623,7 +626,7 @@ class PwshLanguage:
 
     @staticmethod
     def setupFingerprint(spec, env, trace):
-        interpreter = "powershell" if isWindows() else "pwsh"
+        interpreter = spec.interpreterPath and os.path.abspath(spec.interpreterPath) or ("powershell" if isWindows() else "pwsh")
         env["BOB_CWD"] = PwshLanguage.__munge(env["BOB_CWD"])
         return [interpreter, "-c", spec.fingerprintScript]
 
@@ -734,7 +737,8 @@ class PythonLanguage:
             f.write(PythonLanguage.__formatProlog(spec, tmpDir))
             f.write(PythonLanguage.__formatSetup(spec))
 
-        interpreter = "python3" if spec.hasSandbox else sys.executable
+        interpreter = spec.interpreterPath and os.path.abspath(spec.interpreterPath) \
+                      or ("python3" if spec.hasSandbox else sys.executable)
         args = [interpreter, "-sS", "-i", execScriptFile]
         args.extend(os.path.abspath(a) for a in spec.args)
 
@@ -746,7 +750,8 @@ class PythonLanguage:
         with open(realScriptFile, "w") as f:
             f.write(PythonLanguage.__formatScript(spec, script, tmpDir, trace))
 
-        interpreter = "python3" if spec.hasSandbox else sys.executable
+        interpreter = spec.interpreterPath and os.path.abspath(spec.interpreterPath) \
+                      or ("python3" if spec.hasSandbox else sys.executable)
         args = [interpreter, "-sS", execScriptFile]
         args.extend(os.path.abspath(a) for a in spec.args)
 
@@ -778,7 +783,8 @@ class PythonLanguage:
 
     @staticmethod
     def setupFingerprint(spec, env, trace):
-        interpreter = "python3" if spec.hasSandbox else sys.executable
+        interpreter = spec.interpreterPath and os.path.abspath(spec.interpreterPath) \
+                      or ("python3" if spec.hasSandbox else sys.executable)
         return [interpreter, "-sS", "-c", spec.fingerprintScript]
 
 
@@ -843,6 +849,10 @@ class StepSpec:
                 'hostMounts' : step.getSandbox().getMounts(),
                 'user' : step.getSandbox().getUser(),
             }
+
+        interp = step.getInterpreter()
+        if interp is not None:
+            d['interpreterPath'] = os.path.join(interp.getStep().getExecPath(step), interp.getPath())
 
         # What needs to be mounted in a user namespace slim/fat sandbox
         d['depMounts'] = depMounts = [
@@ -934,6 +944,10 @@ class StepSpec:
     @property
     def netAccess(self):
         return self.__data['netAccess']
+
+    @property
+    def interpreterPath(self):
+        return self.__data.get('interpreterPath')
 
     @property
     def sandboxRootWorkspace(self):

@@ -44,6 +44,10 @@ class AbstractIR(ABC):
         return tool
 
     @abstractmethod
+    def mungeInterpreter(self, interp):
+        return interp
+
+    @abstractmethod
     def mungeRecipeSet(self, recipeSet):
         return recipeSet
 
@@ -70,6 +74,7 @@ class StepIR(AbstractIR):
             self.__data['isFingerprinted'] = step._isFingerprinted()
             self.__data['digestScript'] = step.getDigestScript()
             self.__data['tools'] = { name : graph.addTool(tool) for name, tool in step.getTools().items() }
+            self.__data['interpreter'] = graph.addInterpreter(step.getInterpreter())
             self.__data['arguments'] = [ graph.addStep(a, a.getPackage() != step.getPackage()) for a in step.getArguments() ]
             self.__data['allDepSteps'] = [ graph.addStep(a, a.getPackage() != step.getPackage()) for a in step.getAllDepSteps() ]
             self.__data['env'] = step.getEnv()
@@ -215,6 +220,9 @@ class StepIR(AbstractIR):
 
     def getTools(self):
         return { name : self.mungeTool(tool) for name, tool in self.__data['tools'].items() }
+
+    def getInterpreter(self):
+        return self.mungeInterpreter(self.__data['interpreter'])
 
     def getArguments(self):
         return [ self.mungeStep(arg) for arg in self.__data['arguments'] ]
@@ -523,6 +531,30 @@ class ToolIR(AbstractIR):
 
     def getLibs(self):
         return self.__data['libs']
+
+class InterpreterIR(AbstractIR):
+    @classmethod
+    def fromInterpreter(cls, interpreter, graph):
+        self = cls()
+        self.__data = {}
+        self.__data['step'] = graph.addStep(interpreter.getStep(), True)
+        self.__data['path'] = interpreter.getPath()
+        return self
+
+    @classmethod
+    def fromData(cls, data):
+        self = cls()
+        self.__data = data
+        return self
+
+    def toData(self):
+        return self.__data
+
+    def getStep(self):
+        return self.mungeStep(self.__data['step'])
+
+    def getPath(self):
+        return self.__data['path']
 
 class RecipeIR(AbstractIR):
     @classmethod
