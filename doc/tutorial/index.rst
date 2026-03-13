@@ -11,3 +11,4 @@ Contents:
    archive
    create
    fingerprints
+   provide-interpreter
