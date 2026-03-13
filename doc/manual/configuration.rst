@@ -151,6 +151,13 @@ Sandbox
     ``use`` attribute of a dependency, the normal host executables are used.
     Sandboxed builds are described in a separate section below.
 
+Interpreters
+    The interpreters override the executable used to run scripts of a
+    particular language. Initially, the system default is used (e.g. the
+    ``bash`` found in ``$PATH``). Interpreters are defined by
+    ``provideInterpreters`` and must be explicitly imported by downstream
+    recipes by listing ``interpreters`` in the ``use`` attribute.
+
 All of this information is carried as local state when traversing the
 dependency tree. Each recipe gets a local copy that is propagated upstream.
 Any updates to downstream recipes must be done by explicitly offering the
@@ -320,9 +327,10 @@ the following things must be provided by the sandbox image:
   demand and will fail if it already exists.
 * There must *not* be a ``tmp`` directory for the same reason.
 * The interpreter of the used script language must be available (``bash``,
-  ``pwsh`` or ``python``) and it must be in ``$PATH``. When using bash (the
-  default) at least version 4 must be installed. Bob uses associative arrays
-  that are not available in earlier versions.
+  ``pwsh`` or ``python``), which it must be in ``$PATH``, unless the
+  interpreter was provided by ``provideInterpreters`` from an upstream recipe.
+  When using bash (the default) at least version 4 must be installed. Bob uses
+  associative arrays that are not available in earlier versions.
 
 .. _configuration-principle-subst:
 
@@ -1461,6 +1469,9 @@ The following settings are supported:
 |             |                 | * ``result``: build result of the recipe.           |
 |             |                 | * ``tools``: declared build tools of the recipe.    |
 |             |                 | * ``sandbox``:  declared sandbox of the recipe.     |
+|             |                 | * ``interpreters``: declared script interpreters of |
+|             |                 |   the recipe. (see                                  |
+|             |                 |   :ref:`configuration-recipes-provideInterpreters`) |
 |             |                 |                                                     |
 |             |                 | Default: Use the result and dependencies            |
 |             |                 | (``[deps, result]``).                               |
@@ -1472,11 +1483,11 @@ The following settings are supported:
 |             |                 | Defaults to false. Only relevant if ``result`` is   |
 |             |                 | included in these ``use`` list.                     |
 +-------------+-----------------+-----------------------------------------------------+
-| forward     | Boolean         | If true, the imported environment, tools and        |
-|             |                 | sandbox will be forwarded to the dependencies       |
-|             |                 | following this one. Otherwise these variables,      |
-|             |                 | tools and/or sandbox will only be accessible in the |
-|             |                 | current recipe.                                     |
+| forward     | Boolean         | If true, the imported environment, tools, sandbox   |
+|             |                 | and interpreters will be forwarded to the           |
+|             |                 | dependencies following this one. Otherwise these    |
+|             |                 | variables, tools, sandbox and/or interpreters will  |
+|             |                 | only be accessible in the current recipe.           |
 |             |                 |                                                     |
 |             |                 | Default: False.                                     |
 +-------------+-----------------+-----------------------------------------------------+
@@ -2183,6 +2194,63 @@ in the :ref:`configuration-config-whitelist` to be available to the shell.
 The user might amend the mount and search paths in ``default.yaml`` by a
 :ref:`configuration-config-sandbox` entry. The user identity can be overridden
 too.
+
+.. _configuration-recipes-provideInterpreters:
+
+provideInterpreters
+~~~~~~~~~~~~~~~~~~~
+
+Type: Dictionary (String -> Path)
+
+The ``provideInterpreters`` keyword offers script interpreters from the
+current recipe's package result to downstream recipes. The dictionary maps
+a script language name to the relative path of the interpreter executable
+within the package result. The downstream recipe must define ``interpreters``
+in the ``use`` attribute of this dependency to pick it up.
+
+The following language names are recognised:
+
+* ``bash``: Interpreter used for Bash scripts (``buildScript``,
+  ``packageScript``, etc.)
+* ``PowerShell``: Interpreter used for PowerShell scripts.
+* ``python``: Interpreter used for Python scripts.
+
+Example::
+
+    provideInterpreters:
+        bash: bin/bash
+
+This declares that the package result provides a ``bash`` interpreter at
+``bin/bash`` relative to the package root. A downstream recipe can consume
+it as follows::
+
+    depends:
+        - name: my-bash
+          use: [interpreters]
+
+After this, all Bash scripts of the downstream recipe will be executed with
+the provided interpreter instead of the system's default. If the ``forward``
+attribute is additionally set to ``True``, the interpreter is also propagated
+to the dependencies following this one::
+
+    depends:
+        - name: my-bash
+          use: [interpreters]
+          forward: True
+        - name: my-package   # also uses the interpreter from my-bash
+
+Multiple interpreters for different languages can be provided at once::
+
+    provideInterpreters:
+        bash: bin/bash
+        python: bin/python3
+
+.. note::
+    Like the sandbox, the interpreter is considered an invariant of the build.
+    Bob assumes that the consuming recipe will produce the same result
+    regardless of whether the interpreter is provided or the system default is
+    used. Make sure that the provided interpreter is compatible with the
+    scripts in the consuming recipe.
 
 .. _configuration-recipes-relocatable:
 
