@@ -6,7 +6,7 @@
 from unittest import TestCase
 from unittest.mock import Mock
 
-from bob.input import Env, CoreCheckoutStep, CoreBuildStep, CorePackageStep
+from bob.input import Env, CoreCheckoutStep, CoreBuildStep, CorePackageStep, PathsConfig
 
 class Empty:
     pass
@@ -35,7 +35,7 @@ class MockCorePackage:
     def getName(self):
         return self.name
 
-    def refDeref(self, stack, inputTools, inputSandbox, pathFormatter):
+    def refDeref(self, stack, inputTools, inputSandbox, pathsConfig):
         return MockPackage()
 
 class MockPackage:
@@ -47,25 +47,25 @@ class MockPackage:
         pass
 
 nullPkg = MockCorePackage()
-nullFmt = lambda s,t: ""
+nullPathsConfig = PathsConfig(lambda s, t: "", False)
 
 
 class TestCheckoutStep(TestCase):
     def testStereotype(self):
         """Check that the CheckoutStep identifies itself correctly"""
-        s = CoreCheckoutStep(nullPkg).refDeref([], {}, None, nullFmt)
+        s = CoreCheckoutStep(nullPkg).refDeref([], {}, None, nullPathsConfig)
         assert s.isCheckoutStep() == True
         assert s.isBuildStep() == False
         assert s.isPackageStep() == False
 
     def testTrivialDeterministic(self):
         """Trivial steps are deterministic"""
-        s = CoreCheckoutStep(nullPkg).refDeref([], {}, None, nullFmt)
+        s = CoreCheckoutStep(nullPkg).refDeref([], {}, None, nullPathsConfig)
         assert s.isDeterministic()
 
     def testTrivialInvalid(self):
         """Trivial steps are invalid"""
-        s = CoreCheckoutStep(nullPkg).refDeref([], {}, None, nullFmt)
+        s = CoreCheckoutStep(nullPkg).refDeref([], {}, None, nullPathsConfig)
         assert s.isValid() == False
 
     def testDigestStable(self):
