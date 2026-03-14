@@ -2928,3 +2928,401 @@ class TestGlobalInherit(RecipesTmp, TestCase):
         self.assertEqual(["l2-prepend", "l1-prepend", "root-prepend",
                           "l2-append",  "l1-append",  "root-append"],
                          script)
+
+
+class TestProvideInterpreters(RecipesTmp, TestCase):
+    """Tests for the provideInterpreters / use: [interpreters] feature."""
+
+    def testSchemaRejectsUnknownLanguage(self):
+        """provideInterpreters must use recognised language keys only."""
+        self.writeRecipe("root", """\
+            root: True
+            provideInterpreters:
+                fish: bin/fish
+            """)
+        self.assertRaises(ParseError, self.generate)
+
+    def testSchemaRejectsNonStringPath(self):
+        """provideInterpreters values must be strings."""
+        self.writeRecipe("root", """\
+            root: True
+            provideInterpreters:
+                bash: 42
+            """)
+        self.assertRaises(ParseError, self.generate)
+
+    def testBasicPickup(self):
+        """Consumer receives the interpreter when 'use: [interpreters]' is set."""
+        self.writeRecipe("interp", """\
+            provideInterpreters:
+                bash: my/bash
+            """)
+        self.writeRecipe("root", """\
+            root: True
+            depends:
+                - name: interp
+                  use: [interpreters]
+            """)
+        ps = self.generate().walkPackagePath("root").getPackageStep()
+        self.assertIsNotNone(ps.getInterpreter())
+        self.assertEqual(ps.getInterpreter().getPath(), "my/bash")
+
+    def testNotConsumed(self):
+        """Without use: [interpreters] the interpreter is not picked up."""
+        self.writeRecipe("interp", """\
+            packageScript: "true"
+            provideInterpreters:
+                bash: bin/bash
+            """)
+        self.writeRecipe("root", """\
+            root: True
+            depends:
+                - interp
+            """)
+        ps = self.generate().walkPackagePath("root").getPackageStep()
+        self.assertIsNone(ps.getInterpreter())
+
+    def testStep(self):
+        """getStep() is the package step of the interpreter provider."""
+        self.writeRecipe("interp", """\
+            packageScript: "true"
+            provideInterpreters:
+                bash: bin/bash
+            """)
+        self.writeRecipe("root", """\
+            root: True
+            depends:
+                - name: interp
+                  use: [interpreters]
+            """)
+        packages = self.generate()
+        root_ps = packages.walkPackagePath("root").getPackageStep()
+        interp_ps = packages.walkPackagePath("root/interp").getPackageStep()
+        self.assertEqual(interp_ps.getVariantId(),
+                         root_ps.getInterpreter().getStep().getVariantId())
+
+    def testLanguageSpecificity(self):
+        """An interpreter provided for bash is not returned for a Python recipe."""
+        self.writeRecipe("interp", """\
+            packageScript: "true"
+            provideInterpreters:
+                bash: bin/bash
+            """)
+        self.writeRecipe("root", """\
+            root: True
+            scriptLanguage: python
+            depends:
+                - name: interp
+                  use: [interpreters]
+            """)
+        ps = self.generate().walkPackagePath("root").getPackageStep()
+        self.assertIsNone(ps.getInterpreter())
+
+    def testMultipleLanguages(self):
+        """Each script language receives its own interpreter."""
+        self.writeRecipe("interp", """\
+            packageScript: "true"
+            provideInterpreters:
+                bash: bin/bash
+                python: bin/python3
+            """)
+        self.writeRecipe("root-bash", """\
+            root: True
+            depends:
+                - name: interp
+                  use: [interpreters]
+            """)
+        self.writeRecipe("root-python", """\
+            root: True
+            scriptLanguage: python
+            depends:
+                - name: interp
+                  use: [interpreters]
+            """)
+        packages = self.generate()
+        bash_interp = packages.walkPackagePath("root-bash").getPackageStep().getInterpreter()
+        python_interp = packages.walkPackagePath("root-python").getPackageStep().getInterpreter()
+        self.assertIsNotNone(bash_interp)
+        self.assertIsNotNone(python_interp)
+        self.assertEqual("bin/bash", bash_interp.getPath())
+        self.assertEqual("bin/python3", python_interp.getPath())
+
+    def testForwardPropagates(self):
+        """forward: True makes the interpreter available to subsequent deps."""
+        self.writeRecipe("interp", """\
+            packageScript: "true"
+            provideInterpreters:
+                bash: bin/bash
+            """)
+        self.writeRecipe("consumer", """\
+            packageScript: "true"
+            """)
+        self.writeRecipe("root", """\
+            root: True
+            depends:
+                - name: interp
+                  use: [interpreters]
+                  forward: True
+                - name: consumer
+            """)
+        packages = self.generate()
+        ps = packages.walkPackagePath("root/consumer").getPackageStep()
+        self.assertIsNotNone(ps.getInterpreter())
+        self.assertEqual("bin/bash", ps.getInterpreter().getPath())
+
+    def testNoForwardDoesNotPropagate(self):
+        """Without forward the interpreter stays in the declaring recipe only."""
+        self.writeRecipe("interp", """\
+            packageScript: "true"
+            provideInterpreters:
+                bash: bin/bash
+            """)
+        self.writeRecipe("consumer", """\
+            packageScript: "true"
+            """)
+        self.writeRecipe("root", """\
+            root: True
+            depends:
+                - name: interp
+                  use: [interpreters]
+                - name: consumer
+            """)
+        packages = self.generate()
+        ps = packages.walkPackagePath("root/consumer").getPackageStep()
+        self.assertIsNone(ps.getInterpreter())
+
+    def testInheritFalseResetsInterpreter(self):
+        """A dependency with inherit: False does not receive a forwarded interpreter."""
+        self.writeRecipe("interp", """\
+            packageScript: "true"
+            provideInterpreters:
+                bash: bin/bash
+            """)
+        self.writeRecipe("consumer", """\
+            packageScript: "true"
+            """)
+        self.writeRecipe("root", """\
+            root: True
+            depends:
+                - name: interp
+                  use: [interpreters]
+                  forward: True
+                - name: consumer
+                  inherit: False
+            """)
+        packages = self.generate()
+        ps = packages.walkPackagePath("root/consumer").getPackageStep()
+        self.assertIsNone(ps.getInterpreter())
+
+    def testForwardReplacesPreviousInterpreter(self):
+        """A later forwarded interpreter replaces an earlier one for the same language."""
+        self.writeRecipe("interp1", """\
+            packageScript: "echo v1"
+            provideInterpreters:
+                bash: bin/bash-v1
+            """)
+        self.writeRecipe("interp2", """\
+            packageScript: "echo v2"
+            provideInterpreters:
+                bash: bin/bash-v2
+            """)
+        self.writeRecipe("consumer", """\
+            packageScript: "true"
+            """)
+        self.writeRecipe("root", """\
+            root: True
+            depends:
+                - name: interp1
+                  use: [interpreters]
+                  forward: True
+                - name: interp2
+                  use: [interpreters]
+                  forward: True
+                - name: consumer
+            """)
+        packages = self.generate()
+        # consumer should see interp2 because it was forwarded last
+        ps = packages.walkPackagePath("root/consumer").getPackageStep()
+        self.assertIsNotNone(ps.getInterpreter())
+        self.assertEqual("bin/bash-v2", ps.getInterpreter().getPath())
+
+    def testLastProviderWins(self):
+        """When two deps both provide the same language, the later one wins."""
+        self.writeRecipe("interp1", """\
+            packageScript: "true"
+            provideInterpreters:
+                bash: bin/bash-v1
+            """)
+        self.writeRecipe("interp2", """\
+            packageScript: "true"
+            provideInterpreters:
+                bash: bin/bash-v2
+            """)
+        self.writeRecipe("root", """\
+            root: True
+            depends:
+                - name: interp1
+                  use: [interpreters]
+                - name: interp2
+                  use: [interpreters]
+            """)
+        packages = self.generate()
+        ps = packages.walkPackagePath("root").getPackageStep()
+        self.assertEqual("bin/bash-v2", ps.getInterpreter().getPath())
+
+    def testDifferentInterpretersDifferentPackages(self):
+        """Two otherwise identical root recipes that differ only in their
+        interpreter provider are treated as separate packages."""
+        self.writeRecipe("interp", """\
+            multiPackage:
+                v1:
+                    packageScript: "echo v1"
+                    provideInterpreters:
+                        bash: bin/bash
+                v2:
+                    packageScript: "echo v2"
+                    provideInterpreters:
+                        bash: bin/bash
+            """)
+        self.writeRecipe("root", """\
+            root: True
+            multiPackage:
+                a:
+                    depends:
+                        - name: interp-v1
+                          use: [interpreters]
+                b:
+                    depends:
+                        - name: interp-v2
+                          use: [interpreters]
+            """)
+        packages = self.generate()
+        ra = packages.walkPackagePath("root-a").getPackageStep()
+        rb = packages.walkPackagePath("root-b").getPackageStep()
+        # Interpreters do not affect the variantId
+        self.assertEqual(ra.getVariantId(), rb.getVariantId())
+        # The interpreter provider package steps must differ (different builds)
+        interp_a = ra.getInterpreter()
+        interp_b = rb.getInterpreter()
+        self.assertIsNotNone(interp_a)
+        self.assertIsNotNone(interp_b)
+        self.assertNotEqual(interp_a.getStep().getVariantId(),
+                            interp_b.getStep().getVariantId())
+
+    def testClassInheritance(self):
+        """provideInterpreters declared in a class is inherited by the recipe."""
+        self.writeClass("provides-interp", """\
+            provideInterpreters:
+                bash: bin/bash
+            """)
+        self.writeRecipe("interp", """\
+            inherit: [provides-interp]
+            packageScript: "true"
+            """)
+        self.writeRecipe("root", """\
+            root: True
+            depends:
+                - name: interp
+                  use: [interpreters]
+            """)
+        packages = self.generate()
+        interp = packages.walkPackagePath("root").getPackageStep().getInterpreter()
+        self.assertIsNotNone(interp)
+        self.assertEqual("bin/bash", interp.getPath())
+
+    def testRecipeOverridesClass(self):
+        """The recipe's provideInterpreters overrides the class for the same language."""
+        self.writeClass("provides-interp", """\
+            provideInterpreters:
+                bash: from/class
+            """)
+        self.writeRecipe("interp", """\
+            inherit: [provides-interp]
+            packageScript: "true"
+            provideInterpreters:
+                bash: from/recipe
+            """)
+        self.writeRecipe("root", """\
+            root: True
+            depends:
+                - name: interp
+                  use: [interpreters]
+            """)
+        packages = self.generate()
+        interp = packages.walkPackagePath("root").getPackageStep().getInterpreter()
+        self.assertEqual("from/recipe", interp.getPath())
+
+    def testClassMergesDifferentLanguages(self):
+        """Class and recipe provideInterpreters entries for distinct languages are merged."""
+        self.writeClass("provides-bash", """\
+            provideInterpreters:
+                bash: bin/bash
+            """)
+        self.writeRecipe("interp", """\
+            inherit: [provides-bash]
+            packageScript: "true"
+            provideInterpreters:
+                python: bin/python3
+            """)
+        self.writeRecipe("root-bash", """\
+            root: True
+            depends:
+                - name: interp
+                  use: [interpreters]
+            """)
+        self.writeRecipe("root-python", """\
+            root: True
+            scriptLanguage: python
+            depends:
+                - name: interp
+                  use: [interpreters]
+            """)
+        packages = self.generate()
+        bash_interp = packages.walkPackagePath("root-bash").getPackageStep().getInterpreter()
+        python_interp = packages.walkPackagePath("root-python").getPackageStep().getInterpreter()
+        self.assertIsNotNone(bash_interp)
+        self.assertIsNotNone(python_interp)
+        self.assertEqual("bin/bash", bash_interp.getPath())
+        self.assertEqual("bin/python3", python_interp.getPath())
+
+    def testInterpreterInAllDepSteps(self):
+        """The interpreter provider step appears in getAllDepSteps()."""
+        self.writeRecipe("interp", """\
+            packageScript: "true"
+            provideInterpreters:
+                bash: bin/bash
+            """)
+        self.writeRecipe("root", """\
+            root: True
+            depends:
+                - name: interp
+                  use: [interpreters]
+            """)
+        packages = self.generate()
+        root = packages.walkPackagePath("root")
+        interp_ps = packages.walkPackagePath("root/interp").getPackageStep()
+        step_dep_vids = {s.getVariantId() for s in root.getPackageStep().getAllDepSteps()}
+        self.assertIn(interp_ps.getVariantId(), step_dep_vids)
+        package_dep_vids = {s.getVariantId() for s in root.getAllDepSteps()}
+        self.assertIn(interp_ps.getVariantId(), package_dep_vids)
+
+    def testAppliedToBuildAndPackageSteps(self):
+        """The interpreter is visible on both the build step and the package step."""
+        self.writeRecipe("interp", """\
+            packageScript: "true"
+            provideInterpreters:
+                bash: bin/bash
+            """)
+        self.writeRecipe("root", """\
+            root: True
+            depends:
+                - name: interp
+                  use: [interpreters]
+            buildScript: "true"
+            """)
+        packages = self.generate()
+        root = packages.walkPackagePath("root")
+        self.assertIsNotNone(root.getBuildStep().getInterpreter())
+        self.assertIsNotNone(root.getPackageStep().getInterpreter())
+        self.assertEqual("bin/bash", root.getBuildStep().getInterpreter().getPath())
+        self.assertEqual("bin/bash", root.getPackageStep().getInterpreter().getPath())
