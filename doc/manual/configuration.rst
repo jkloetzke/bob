@@ -195,9 +195,9 @@ Script languages
 
 Bob itself is written in the Python scripting language but actually independent
 of the scripting language that is used during step execution (see above).
-Currently Bob supports two scripting languages: bash and PowerShell. Classes
-and recipes may define their scripts in one or both scripting languages. The
-actually used language at build time is determined by the
+Currently Bob supports three scripting languages: bash, PowerShell and Python.
+Classes and recipes may define their scripts in one or more of these scripting
+languages. The actually used language at build time is determined by the
 :ref:`configuration-recipes-scriptLanguage` key or, if nothing was specified,
 by the project :ref:`configuration-config-scriptLanguage` setting. The other
 language scripts are ignored.
@@ -319,10 +319,10 @@ the following things must be provided by the sandbox image:
 * There must *not* be a ``home`` directory. Bob creates this directory on
   demand and will fail if it already exists.
 * There must *not* be a ``tmp`` directory for the same reason.
-* The interpreter of the used script language must be available (``bash`` or
-  ``pwsh``) and it must be in ``$PATH``. When using bash (the default) at
-  least version 4 must be installed. Bob uses associative arrays that are not
-  available in earlier versions.
+* The interpreter of the used script language must be available (``bash``,
+  ``pwsh`` or ``python``) and it must be in ``$PATH``. When using bash (the
+  default) at least version 4 must be installed. Bob uses associative arrays
+  that are not available in earlier versions.
 
 .. _configuration-principle-subst:
 
@@ -545,8 +545,8 @@ are configured consistent between package variants.
 
 .. _configuration-recipes-scripts:
 
-{checkout,build,package}Script[{Bash,Pwsh}]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+{checkout,build,package}Script[{Bash,Pwsh,Python}]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Type: String
 
@@ -562,7 +562,8 @@ symbol on the end of the first line)::
 The suffix of the keyword determines the language of the script. Using the
 ``Bash`` suffix (e.g.  ``buildScriptBash``) defines a script that is
 interpreted with ``bash``. Likewise, the ``Pwsh`` suffix (e.g.
-``buildScriptPwsh``) defines a PowerShell script. Which language is used at
+``buildScriptPwsh``) defines a PowerShell script and the ``Python`` suffix
+(e.g.  ``buildScriptPython``) defines a Python script. Which language is used at
 build time is determined by the :ref:`configuration-recipes-scriptLanguage` key
 or, if nothing was specified, by the project
 :ref:`configuration-config-scriptLanguage` setting. A keyword without a suffix
@@ -642,6 +643,10 @@ scripts they are associative arrays. See
 `Bash Arrays <https://www.gnu.org/savannah-checkouts/gnu/bash/manual/bash.html#Arrays>`_
 for more information. In PowerShell scripts they are defined as
 `Hash Tables <https://docs.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_hash_tables>`_.
+In Python scripts they are provided as ordinary ``dict`` global variables
+(e.g. ``BOB_DEP_PATHS["libfoo-dev"]``). Likewise, the environment variables
+are available through the ``os.environ`` mapping instead of ``$BOB_CWD`` resp.
+``%BOB_CWD%``.
 
 For PowerShell scripts a utility function called ``Check-Command`` is
 available. It has two arguments: the first one (``ScriptBlock``) expects a
@@ -660,10 +665,21 @@ external command fails. Make sure to wrap calls to external tools with
 ``Check-Command`` or check ``$lastexitcode`` yourself. Otherwise the build will
 not detect errors involving external commands!
 
+Python scripts are run by a plain interpreter that is started with the ``-sS``
+options. This ignores the user site directory and does not import the ``site``
+module so that as little host state as possible leaks into the build. Any
+additional modules that are needed must therefore be provided by the recipes
+(e.g. through a tool). The ``os``, ``os.path`` and ``sys`` modules are imported
+automatically. As with the other languages, external commands are not checked
+implicitly. Use e.g. ``subprocess.run(..., check=True)`` or raise an exception
+yourself so that a failing command actually fails the build. Outside of a
+sandbox the same interpreter that runs Bob is used. Inside a sandbox a
+``python`` executable must be available in ``$PATH``.
+
 .. _configuration-recipes-setup:
 
-{checkout,build,package}Setup[{Bash,Pwsh}]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+{checkout,build,package}Setup[{Bash,Pwsh,Python}]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Type: String
 
@@ -684,8 +700,8 @@ Other than the above differences setup scripts are identical to
 
 .. _configuration-recipes-finalize:
 
-{checkout,build,package}Finalize[{Bash,Pwsh}]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+{checkout,build,package}Finalize[{Bash,Pwsh,Python}]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Type: String
 
@@ -1609,8 +1625,8 @@ Removed in version 0.25.
 
 .. _configuration-recipes-fingerprintScript:
 
-fingerprintScript[{Bash,Pwsh}]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+fingerprintScript[{Bash,Pwsh,Python}]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Type: String
 
@@ -1648,8 +1664,10 @@ scripts of inherited classes are concatenated (but only if their
 The suffix of the keyword determines the language of the script. Using the
 ``Bash`` suffix (``fingerprintScriptBash``) defines a script that is
 interpreted with ``bash``.  Likewise, the ``Pwsh`` suffix
-(``fingerprintScriptPwsh``) defines a PowerShell script. Which language is used at
-build time is determined by the :ref:`configuration-recipes-scriptLanguage` key
+(``fingerprintScriptPwsh``) defines a PowerShell script and the ``Python``
+suffix (``fingerprintScriptPython``) defines a Python script. Which language is
+used at build time is determined by the
+:ref:`configuration-recipes-scriptLanguage` key
 or, if nothing was specified, by the project
 :ref:`configuration-config-scriptLanguage` setting. The keyword without a suffix
 (``fingerprintScript``) is interpreted in whatever language is finally used at
@@ -2200,14 +2218,15 @@ boolean according to the rules explained in
 scriptLanguage
 ~~~~~~~~~~~~~~
 
-Type: Enumeration: ``bash``, ``PowerShell``.
+Type: Enumeration: ``bash``, ``PowerShell``, ``python``.
 
 Defines the scripting language which is used to run the
 ``{checkout,build,package,fingerprint}Script`` scripts when building the
 package. If nothing is specified the :ref:`configuration-config-scriptLanguage`
 setting from config.yaml is used. Depending on the chosen language Bob will
-either invoke ``bash`` or ``pwsh``/``powershell`` as script interpreter. In
-either case the command must be present in ``$PATH``/``%PATH%``.
+either invoke ``bash``, ``pwsh``/``powershell`` or ``python`` as script
+interpreter. In either case the command must be present in
+``$PATH``/``%PATH%``.
 
 .. _configuration-recipes-shared:
 
@@ -2454,14 +2473,14 @@ This will explicitly request old behaviour for the ``defaultFileMode`` policy.
 scriptLanguage
 ~~~~~~~~~~~~~~
 
-Type: Enumeration: ``bash``, ``PowerShell``.
+Type: Enumeration: ``bash``, ``PowerShell``, ``python``.
 
 Defines the scripting language which is used to run the
 ``{checkout,build,package,fingerprint}Script`` scripts. Defaults to ``bash``.
 Might be overrided on a case-by-case basis in a class or recipe with
 :ref:`configuration-recipes-scriptLanguage`.  Depending on the chosen language
-Bob will either invoke ``bash`` or ``pwsh``/``powershell`` as script
-interpreter. In either case the command must be present in
+Bob will either invoke ``bash``, ``pwsh``/``powershell`` or ``python`` as
+script interpreter. In either case the command must be present in
 ``$PATH``/``%PATH%``.
 
 .. important::
