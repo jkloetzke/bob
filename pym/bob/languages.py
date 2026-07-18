@@ -157,7 +157,7 @@ class IncludeResolver(ABC):
         self.__incDigests = [ hashlib.sha1(origText.encode('utf8')).digest().hex() ]
         self.__incFiles = {}
 
-    def __nextIncludeFile(self, content):
+    def _nextIncludeFile(self, content):
         name = "{}_{}".format(self.varBase, self.count).translate(INVALID_CHAR_TRANS)
         self.count += 1
         self.__incFiles[name] = content
@@ -180,7 +180,7 @@ class IncludeResolver(ABC):
 
         self.__incDigests.append(hashlib.sha1(allContent).digest().hex())
         if mode == '<':
-            ret = self._includeFile(self.__nextIncludeFile(allContent))
+            ret = self._includeFile(self._nextIncludeFile(allContent))
         elif mode == '@':
             ret = self._includeFiles(content)
         else:
@@ -194,7 +194,7 @@ class IncludeResolver(ABC):
         pass
 
     def _includeFiles(self, contentList):
-        return " ".join((self._includeFile(self.__nextIncludeFile(content))
+        return " ".join((self._includeFile(self._nextIncludeFile(content))
                          for content in contentList))
 
     @abstractmethod
