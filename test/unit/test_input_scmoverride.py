@@ -207,3 +207,36 @@ class TestScmOverride(TestCase):
 
         o = ScmOverride(spec)
         self.assertEqual(spec, yaml.load(str(o), Loader=yaml.Loader))
+
+    def testHashableNestedValue(self):
+        """A scmOverride with a nested dict value (e.g. url SCM headers) must
+        still be hashable. The builder collects active overrides in a set()."""
+        o = ScmOverride({
+            'match' : { 'url' : "https://gitea.example.com/*" },
+            'set' : { 'headers' : { 'Authorization' : "token 1234" } },
+        })
+        # Must not raise "unhashable type: 'dict'".
+        self.assertIn(o, { o })
+
+        # Equal overrides hash equally, unequal ones stay distinct.
+        same = ScmOverride({
+            'match' : { 'url' : "https://gitea.example.com/*" },
+            'set' : { 'headers' : { 'Authorization' : "token 1234" } },
+        })
+        other = ScmOverride({
+            'match' : { 'url' : "https://gitea.example.com/*" },
+            'set' : { 'headers' : { 'Authorization' : "token 4321" } },
+        })
+        self.assertEqual(hash(o), hash(same))
+        self.assertEqual(len({ o, same, other }), 2)
+
+    def testMangleNestedValue(self):
+        """A nested dict value is injected verbatim into the matched SCM."""
+        o = ScmOverride({
+            'match' : { 'scm' : "url" },
+            'set' : { 'headers' : { 'Authorization' : "token 1234" } },
+        })
+        scm = { 'scm' : "url", 'url' : "https://gitea.example.com/x.tar" }
+        match, mangled = o.mangle(scm, Env())
+        self.assertTrue(match)
+        self.assertEqual(mangled['headers'], { 'Authorization' : "token 1234" })
