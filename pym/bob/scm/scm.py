@@ -13,6 +13,19 @@ import re
 
 SYNTHETIC_SCM_PROPS = frozenset(('__source', 'recipe', 'overridden'))
 
+def _freezeValue(value):
+    """Recursively turn a (possibly nested) value into a hashable one.
+
+    scmOverrides 'match' and 'set' allow arbitrary values (e.g. the 'headers'
+    dict of an url SCM). Such nested dicts/lists are unhashable, so convert
+    them into frozensets/tuples to make ScmOverride hashable.
+    """
+    if isinstance(value, dict):
+        return frozenset((k, _freezeValue(v)) for k, v in value.items())
+    if isinstance(value, list):
+        return tuple(_freezeValue(v) for v in value)
+    return value
+
 class ScmOverride:
     def __init__(self, override):
         self.__match = override.get("match", {})
@@ -54,8 +67,8 @@ class ScmOverride:
         return True
 
     def __hash__(self):
-        return hash((frozenset(self.__match.items()), frozenset(self.__del),
-            frozenset(self.__set.items()), frozenset(self.__replace.items())))
+        return hash((_freezeValue(self.__match), frozenset(self.__del),
+            _freezeValue(self.__set), frozenset(self.__replace.items())))
 
     def __eq__(self, other):
         return ((self.__match, self.__del, self.__set, self.__replace) ==
