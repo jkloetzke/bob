@@ -28,7 +28,9 @@ def getNetLoc(url):
     """
     netloc = url.netloc
     if url.username is not None:
-        netloc = netloc.split('@')[1]
+        # urlparse() delimits the user info at the *last* '@'. Cut at the same
+        # one, otherwise a password with an unencoded '@' yields a bogus host.
+        netloc = netloc.rsplit('@', 1)[1]
 
     return netloc
 
