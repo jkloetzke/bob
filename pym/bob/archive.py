@@ -24,7 +24,8 @@ from .errors import BuildError, BobError
 from .tty import stepAction, stepMessage, \
     SKIPPED, EXECUTED, WARNING, INFO, TRACE, ERROR, IMPORTANT
 from .utils import asHexStr, removePath, isWindows, getBashPath, tarfileOpen, binStat
-from .webdav import WebDav, WebdavError, WebdavNotFoundError, WebdavAlreadyExistsError
+from .webdav import WebDav, WebdavError, WebdavNotFoundError, WebdavAlreadyExistsError, \
+    getNetLoc
 from tempfile import mkstemp, NamedTemporaryFile, TemporaryFile, gettempdir
 import asyncio
 import concurrent.futures
@@ -874,7 +875,7 @@ class HttpArchive(BaseArchive):
             return name
 
         url = self.__url
-        return urllib.parse.urlunparse((url.scheme, url.netloc, url.path, '', '', ''))
+        return urllib.parse.urlunparse((url.scheme, getNetLoc(url), url.path, '', '', ''))
 
     def __retry(self, request):
         retries = self._retries
@@ -899,7 +900,7 @@ class HttpArchive(BaseArchive):
 
     def _remoteName(self, buildId, suffix):
         url = self.__url
-        return urllib.parse.urlunparse((url.scheme, url.netloc, self._makePath(buildId, suffix), '', '', ''))
+        return urllib.parse.urlunparse((url.scheme, getNetLoc(url), self._makePath(buildId, suffix), '', '', ''))
 
     def _exists(self, path):
         return self.__retry(lambda: self._webdav.exists(path))
@@ -963,7 +964,7 @@ class HttpArchive(BaseArchive):
                 pass
 
     def getArchiveUri(self):
-        return self.__url.netloc + self.__url.path
+        return getNetLoc(self.__url) + self.__url.path
 
 
 class HttpDownloader:
