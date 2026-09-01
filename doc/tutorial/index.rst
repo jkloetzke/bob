@@ -12,3 +12,4 @@ Contents:
    create
    fingerprints
    provide-interpreter
+   virtual-packages
