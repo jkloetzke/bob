@@ -18,6 +18,23 @@ class WebdavNotFoundError(WebdavError):
 class WebdavAlreadyExistsError(WebdavError):
     pass
 
+
+def getNetLoc(url):
+    """Get the network location of a parsed URL without the credentials.
+
+    The user name and password of the HTTP basic authentication are part of
+    the URL. They are sent in the Authorization header instead and must be
+    kept out of the request URL and of anything that is shown to the user.
+    """
+    netloc = url.netloc
+    if url.username is not None:
+        # urlparse() delimits the user info at the *last* '@'. Cut at the same
+        # one, otherwise a password with an unencoded '@' yields a bogus host.
+        netloc = netloc.rsplit('@', 1)[1]
+
+    return netloc
+
+
 class WebDav:
 
     class PartialDownloader:
@@ -55,12 +72,7 @@ class WebDav:
         return headers
 
     def _getURL(self, path):
-        # remove username and password from URI
-        netloc = self.__url.netloc
-        if self.__url.username is not None:
-            netloc = self.__url.netloc.split('@')[1]
-
-        return urlunsplit((self.__url.scheme, netloc, path,
+        return urlunsplit((self.__url.scheme, getNetLoc(self.__url), path,
                            self.__url.query, self.__url.fragment))
 
     def exists(self, path):

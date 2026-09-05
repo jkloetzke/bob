@@ -25,7 +25,7 @@ from mocks.http_server import HttpServerMock
 from bob.archive import DummyArchive, HttpArchive, getArchiver
 from bob.errors import BuildError
 from bob.utils import runInEventLoop, getProcessPoolExecutor
-from bob.webdav import WebdavError
+from bob.webdav import WebdavError, getNetLoc
 
 DOWNLOAD_ARITFACT = b'\x00'*20
 NOT_EXISTS_ARTIFACT = b'\x01'*20
@@ -691,6 +691,51 @@ class TestHttpBasicAuthArchive(BaseTester, TestCase):
 
         run(archive.downloadPackage(DummyStep(), b'\x00'*20, "unused", "unused", executor=self.executor))
         self.assertEqual(run(archive.downloadLocalLiveBuildId(DummyStep(), b'\x00'*20, executor=self.executor)), None)
+
+    def testNoCredentialsInMessages(self):
+        """The URL credentials must never show up in user visible strings.
+
+        Everything that is derived from the URL ends up in log messages and
+        therefore in build logs and CI consoles.
+        """
+        spec = { }
+        self._setArchiveSpec(spec)
+        archive = HttpArchive(spec)
+
+        for name, uri in [
+                ("getArchiveName", archive.getArchiveName()),
+                ("getArchiveUri", archive.getArchiveUri()),
+                ("_remoteName", archive._remoteName(DOWNLOAD_ARITFACT, ".tgz")),
+            ]:
+            with self.subTest(method=name):
+                self.assertNotIn(self.PASSWORD, uri)
+                self.assertNotIn(urllib.parse.quote(self.PASSWORD), uri)
+                self.assertNotIn("@", uri)
+                # ...but the host must still be there to be of any use
+                self.assertIn("{}:{}".format(self.ip, self.port), uri)
+
+
+class TestGetNetLoc(TestCase):
+    """Unit tests for the URL credential sanitizer."""
+
+    def testNoCredentials(self):
+        url = urllib.parse.urlparse("https://host.test:8443/path")
+        self.assertEqual(getNetLoc(url), "host.test:8443")
+
+    def testCredentialsRemoved(self):
+        url = urllib.parse.urlparse("https://user:pass@host.test:8443/path")
+        self.assertEqual(getNetLoc(url), "host.test:8443")
+
+    def testPasswordWithAtSign(self):
+        """urlparse() delimits at the *last* '@'. We must cut at the same one."""
+        url = urllib.parse.urlparse("https://user:p@ssw@rd@host.test/path")
+        self.assertEqual(url.hostname, "host.test")
+        self.assertEqual(getNetLoc(url), "host.test")
+
+    def testIPv6(self):
+        url = urllib.parse.urlparse("https://user:pass@[::1]:8443/path")
+        self.assertEqual(getNetLoc(url), "[::1]:8443")
+
 
 @skipIf(sys.platform.startswith("win"), "requires POSIX platform")
 class TestCustomArchive(BaseTester, TestCase):
