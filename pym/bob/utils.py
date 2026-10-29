@@ -682,19 +682,26 @@ class DirHasher:
 
         self.__index.open()
         try:
-            return self.__hashDir(os.fsencode(path))
+            return (self.__hashDir(path), self.size)
         finally:
             self.__index.close()
 
 
+def _hashDirWithSize(path, index, ignoreDirs):
+    global _hashDirWithSize
+    try:
+        from ._dirhasher import hash_directory_with_size
+        _hashDirWithSize = hash_directory_with_size
+    except ImportError:
+        _hashDirWithSize = lambda path, index, ignoreDirs: DirHasher(index, ignoreDirs).hashDirectory(path)
+
+    return _hashDirWithSize(path, index, ignoreDirs)
+
 def hashDirectory(path, index=None, ignoreDirs=None):
-    return DirHasher(index, ignoreDirs).hashDirectory(path)
+    return _hashDirWithSize(path, index, ignoreDirs)[0]
 
 def hashDirectoryWithSize(path, index=None, ignoreDirs=None):
-    h = DirHasher(index, ignoreDirs)
-    retHash = h.hashDirectory(path)
-    retSize = h.size
-    return retHash, retSize
+    return _hashDirWithSize(path, index, ignoreDirs)
 
 def binStat(path):
     st = os.stat(path)
