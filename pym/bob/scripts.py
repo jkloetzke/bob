@@ -280,8 +280,8 @@ def bob(bobRoot = None):
         try:
             from .develop.make import makeDirHasher
             makeDirHasher()
-        except ImportError:
-            pass
+        except ImportError: # pragma: no cover
+            pass # not available in installed packages
 
         if args.command in availableCommands:
             cmd = availableCommands[args.command][1]
