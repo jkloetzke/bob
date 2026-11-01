@@ -757,7 +757,7 @@ class TestHttpArchiveRetries(Base, TestCase):
         self.spec = {'backend' : 'http', 'name' : 'http-archive', 'flags' : ['download', 'upload', 'managed']}
 
     def _getHttpArchiveInstance(self, port):
-        self.spec["url"] = "http://localhost:{}/".format(port)
+        self.spec["url"] = "http://127.0.0.1:{}/".format(port)
         recipes = DummyRecipeSet(self.spec)
         return getArchiver(recipes)
 
@@ -1148,7 +1148,7 @@ class TestGiteaArchiveRetries(Base, TestCase):
 
     def _getArchive(self, port, retries):
         spec = {'backend':'gitea', 'name':'gitea', 'owner':'o', 'package':'p',
-                'retries':retries, 'url':"http://localhost:{}".format(port)}
+                'retries':retries, 'url':"http://127.0.0.1:{}".format(port)}
         return getArchiver(DummyRecipeSet(spec))
 
     def _startServer(self, retries):
@@ -1214,7 +1214,7 @@ class TestGiteaManagedArchive(Base, TestCase):
     def _archive(self):
         spec = {'backend':'gitea', 'name':'gitea', 'owner':'o', 'package':'p',
                 'flags':['download', 'upload', 'managed'],
-                'url':"http://localhost:{}".format(self.httpd.server_address[1])}
+                'url':"http://127.0.0.1:{}".format(self.httpd.server_address[1])}
         return getArchiver(DummyRecipeSet(spec))
 
     def testCanManage(self):
@@ -1346,7 +1346,7 @@ class TestGiteaArchiveErrors(Base, TestCase):
         thread.start()
         port = self.httpd.server_address[1]
         return GiteaArchive({"backend": "gitea", "owner": "o", "package": "p",
-            "retries": 0, "url": "http://localhost:{}".format(port)})
+            "retries": 0, "url": "http://127.0.0.1:{}".format(port)})
 
     def _upload(self, archive):
         path = archive._makePath(self.BUILD_ID, ".tgz")
@@ -1357,7 +1357,7 @@ class TestGiteaArchiveErrors(Base, TestCase):
     def testCanManageAndUri(self):
         archive = self._archive({})
         self.assertTrue(archive._canManage())
-        self.assertIn("localhost", archive.getArchiveUri())
+        self.assertIn("127.0.0.1", archive.getArchiveUri())
 
     def testDownloadNotFound(self):
         archive = self._archive({"GET": ("status", 404)})
