@@ -603,20 +603,6 @@ class DirHasher:
         finally:
             self.__index.close()
 
-    def hashPath(self, path):
-        path = os.fsencode(path)
-        try:
-            s = os.lstat(path)
-        except OSError as err:
-            logging.getLogger(__name__).warning("Cannot stat '%s': %s", path, str(err))
-            return b''
-
-        self.__index.open()
-        try:
-            return self.__hashEntry(path, b'', s)
-        finally:
-            self.__index.close()
-
 
 def hashDirectory(path, index=None, ignoreDirs=None):
     return DirHasher(index, ignoreDirs).hashDirectory(path)
@@ -626,9 +612,6 @@ def hashDirectoryWithSize(path, index=None, ignoreDirs=None):
     retHash = h.hashDirectory(path)
     retSize = h.size
     return retHash, retSize
-
-def hashPath(path, index=None, ignoreDirs=None):
-    return DirHasher(index, ignoreDirs).hashPath(path)
 
 def binStat(path):
     st = os.stat(path)
