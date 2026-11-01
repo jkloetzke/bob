@@ -7,6 +7,7 @@ from tempfile import NamedTemporaryFile, TemporaryDirectory
 from unittest import TestCase, skipIf
 from unittest.mock import MagicMock, mock_open, patch
 import binascii
+import errno
 import hashlib
 
 import os
@@ -53,6 +54,37 @@ def makeOsScandir(entries):
     m = MagicMock()
     m.return_value = OsScandirList(entries)
     return m
+
+def waitClockTick(path):
+    """Wait until the file system clock has advanced.
+
+    Files that are not older than the file system time are "racily clean"
+    and are not recorded in the index. Make sure all files are old enough
+    so that the index content is deterministic.
+    """
+    def change_time():
+        with NamedTemporaryFile(dir=path) as f:
+            if sys.platform == "win32":
+                return os.fstat(f.fileno()).st_mtime_ns
+            else:
+                return os.fstat(f.fileno()).st_ctime_ns
+    start = change_time()
+    while change_time() <= start:
+        time.sleep(0.001)
+
+class FailingFile:
+    """File wrapper that fails all writes after the first one."""
+    def __init__(self, f):
+        self.f = f
+        self.name = f.name
+        self.writes = 0
+    def write(self, data):
+        self.writes += 1
+        if self.writes > 1:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return self.f.write(data)
+    def close(self):
+        self.f.close()
 
 class CommonHashDirTests:
     def setUp(self):
@@ -146,6 +178,27 @@ class CommonHashDirTests:
                 self.assertEqual(self.hashDirectory(tmp, index), expect)
             self.assertTrue(cm.records[0].getMessage().startswith("Cannot write hash cache:"))
 
+    def testIndexIsDirectory(self):
+        """Unreadable and unwritable index just issues warnings"""
+        with TemporaryDirectory() as indexDir:
+            index = os.path.join(indexDir, "index")
+            os.mkdir(index)
+            with TemporaryDirectory() as tmp:
+                with open(os.path.join(tmp, "file"), "wb") as f:
+                    f.write(b'abc')
+                if sys.platform == "win32":
+                    expect = b'\x88\xee\x84\x87Y\xb21\xaa\x84\x98\x05\xc9&\xcf#4\x05\xe2\xab\x15'
+                else:
+                    expect = b'\x039\xa9+\xebb\xaf\xbe\x11>@\xf7\xeeMl}\xb6\xd0\x9a\x90'
+                with self.assertLogs(level='WARNING') as cm:
+                    self.assertEqual(self.hashDirectory(tmp, index), expect)
+            msgs = [ r.getMessage() for r in cm.records ]
+            self.assertEqual(len(msgs), 2)
+            self.assertTrue(msgs[0].startswith("Cannot open hash cache:"))
+            self.assertTrue(msgs[1].startswith("Cannot write hash cache:"))
+            # The temporary new index must have been removed
+            self.assertEqual(os.listdir(indexDir), ["index"])
+
     def testBadIndex(self):
         """A corrupted index is ignored"""
         with TemporaryDirectory() as tmp:
@@ -178,6 +231,49 @@ class CommonHashDirTests:
 
 class TestHashDirPython(CommonHashDirTests, TestCase):
     hashDirectory = staticmethod(pyHashDirectory)
+
+    def prepareCacheWriteFailure(self, indexDir, ws):
+        """Create a valid index and add a file that must be added to the index."""
+        index = os.path.join(indexDir, "index.bin")
+        with open(os.path.join(ws, "a"), "wb") as f:
+            f.write(b'abc')
+        waitClockTick(indexDir)
+        self.hashDirectory(ws, index)
+        with open(index, "rb") as f:
+            oldIndex = f.read()
+        with open(os.path.join(ws, "b"), "wb") as f:
+            f.write(b'def')
+        waitClockTick(indexDir)
+        return index, oldIndex
+
+    def testCacheWriteFails(self):
+        """A failed index update keeps the old index"""
+        with TemporaryDirectory() as indexDir, TemporaryDirectory() as ws:
+            index, oldIndex = self.prepareCacheWriteFailure(indexDir, ws)
+            with patch("bob.utils.NamedTemporaryFile",
+                       side_effect=lambda *a, **kw: FailingFile(NamedTemporaryFile(*a, **kw))):
+                with self.assertLogs(level='WARNING') as cm:
+                    h = self.hashDirectory(ws, index)
+            self.assertEqual(h, self.hashDirectory(ws))
+            self.assertEqual(len(cm.records), 1)
+            self.assertTrue(cm.records[0].getMessage().startswith("Cannot write hash cache:"))
+            with open(index, "rb") as f:
+                self.assertEqual(f.read(), oldIndex)
+            self.assertEqual(os.listdir(indexDir), ["index.bin"])
+
+    def testCacheCleanupFails(self):
+        """Failing to remove the aborted index is ignored"""
+        with TemporaryDirectory() as indexDir, TemporaryDirectory() as ws:
+            index, oldIndex = self.prepareCacheWriteFailure(indexDir, ws)
+            with patch("bob.utils.NamedTemporaryFile",
+                       side_effect=lambda *a, **kw: FailingFile(NamedTemporaryFile(*a, **kw))), \
+                 patch("os.unlink", side_effect=OSError(errno.EACCES, "Permission denied")):
+                with self.assertLogs(level='WARNING') as cm:
+                    h = self.hashDirectory(ws, index)
+            self.assertEqual(h, self.hashDirectory(ws))
+            self.assertEqual(len(cm.records), 1)
+            with open(index, "rb") as f:
+                self.assertEqual(f.read(), oldIndex)
 
     def testBigIno(self):
         """Test that index handles big inode numbers as found on Windows"""
@@ -381,21 +477,7 @@ class TestHashDirCompat(TestCase):
         self.check(self.root, True)
 
     def waitClockTick(self):
-        """Wait until the file system clock has advanced.
-
-        Files that are not older than the file system time are "racily clean"
-        and are not recorded in the index. Make sure all files are old enough
-        so that the index content is deterministic.
-        """
-        def change_time():
-            with NamedTemporaryFile(dir=self.tmp.name) as f:
-                if sys.platform == "win32":
-                    return os.fstat(f.fileno()).st_mtime_ns
-                else:
-                    return os.fstat(f.fileno()).st_ctime_ns
-        start = change_time()
-        while change_time() <= start:
-            time.sleep(0.001)
+        waitClockTick(self.tmp.name)
 
     def testHashDirectoryIndex(self):
         """Both implementations create the same index"""
