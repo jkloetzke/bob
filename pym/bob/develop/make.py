@@ -90,3 +90,7 @@ def makeManpages():
             cwd=inputPath)
 
     return resultPath
+
+if __name__ == "__main__":
+    makeSandboxHelper()
+    makeDirHasher()
